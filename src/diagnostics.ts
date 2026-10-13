@@ -3,6 +3,10 @@ import {
   isMachineContextTooSmall,
   minimumMachineContextLength
 } from './contextLength';
+import {
+  supportedThinkingLevel,
+  type ThinkingPolicy
+} from './thinking';
 
 interface LoadedModel {
   name: string;
@@ -274,4 +278,71 @@ function copyConfiguration(configuration: OllamaDiagnosticsConfiguration): Ollam
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export interface ThinkingDiagnosticModel {
+  readonly model: string;
+  readonly thinkingPolicy?: ThinkingPolicy;
+  readonly defaultSource?: 'server' | 'compatibility';
+}
+
+export function thinkingDiagnosticLines(
+  models: readonly ThinkingDiagnosticModel[],
+  configuredThinkingLevels?: unknown
+): string[] {
+  const configuredMap = isRecord(configuredThinkingLevels) ? configuredThinkingLevels : undefined;
+  const thinkingModels = models.filter(model => model.thinkingPolicy !== undefined);
+  const nonThinkingWithOverride = models.filter(
+    model => model.thinkingPolicy === undefined && configuredMap && Object.hasOwn(configuredMap, model.model)
+  );
+
+  if (thinkingModels.length === 0 && nonThinkingWithOverride.length === 0) {
+    return [];
+  }
+
+  const lines: string[] = ['Thinking settings:'];
+  for (const model of thinkingModels) {
+    const policy = model.thinkingPolicy!;
+    const rawOverride = configuredMap && Object.hasOwn(configuredMap, model.model)
+      ? configuredMap[model.model]
+      : undefined;
+    const effective = supportedThinkingLevel(policy, rawOverride);
+    const defaultLabel = model.defaultSource === 'server'
+      ? `server-advertised default: ${formatThinkingValue(policy.defaultLevel)}`
+      : model.defaultSource === 'compatibility'
+        ? `compatibility fallback default: ${formatThinkingValue(policy.defaultLevel)}`
+        : `default: ${formatThinkingValue(policy.defaultLevel)}`;
+
+    const supportedList = `supported values: [${policy.levels.map(formatThinkingValue).join(', ')}]`;
+
+    let overrideStatus: string;
+    if (rawOverride === undefined) {
+      overrideStatus = 'configured override: none; think will be omitted to use server default';
+    } else if (effective !== undefined) {
+      overrideStatus = `configured override: ${formatThinkingValue(rawOverride)}; effective setting for next request: ${formatThinkingValue(effective)}`;
+    } else {
+      overrideStatus = `configured override: ${formatThinkingValue(rawOverride)} (unsupported, ignored); think will be omitted to use server default`;
+    }
+
+    lines.push(`- ${model.model}: ${supportedList}; ${defaultLabel}; ${overrideStatus}`);
+  }
+
+  for (const model of nonThinkingWithOverride) {
+    const rawOverride = configuredMap![model.model];
+    lines.push(
+      `- ${model.model}: model does not support thinking; configured override: ${formatThinkingValue(rawOverride)} (ignored); think will be omitted`
+    );
+  }
+
+  return lines;
+}
+
+function formatThinkingValue(value: unknown): string {
+  if (typeof value === 'boolean') {
+    return String(value);
+  }
+  if (typeof value === 'string') {
+    return JSON.stringify(value);
+  }
+  return String(value);
 }

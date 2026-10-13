@@ -32,7 +32,9 @@ import {
 import {
   OllamaDiagnosticsConfigurationTracker,
   type OllamaDiagnosticsConfiguration,
-  type OllamaDiagnosticsConfigurationSelection
+  type OllamaDiagnosticsConfigurationSelection,
+  thinkingDiagnosticLines,
+  type ThinkingDiagnosticModel
 } from './diagnostics';
 import {
   supportedThinkingLevel,
@@ -53,6 +55,7 @@ interface OllamaLanguageModel extends vscode.LanguageModelChatInformation {
   headers: Record<string, string>;
   local: boolean;
   thinkingPolicy?: ThinkingPolicy;
+  defaultSource?: 'server' | 'compatibility';
   recommendedReplacement?: string;
 }
 
@@ -149,6 +152,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   private readonly outdatedModelWarnings = new OutdatedModelWarningTracker();
   private readonly machineContextWarnings = new Set<string>();
   private readonly diagnosticsConfigurations = new OllamaDiagnosticsConfigurationTracker();
+  private lastProvidedModels: OllamaLanguageModel[] = [];
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
 
   constructor(private readonly output?: vscode.OutputChannel) {}
@@ -159,6 +163,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   }
 
   dispose() {
+    this.lastProvidedModels = [];
     this.changeEmitter.dispose();
   }
 
@@ -166,6 +171,10 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     workspaceConfiguration: OllamaDiagnosticsConfiguration
   ): OllamaDiagnosticsConfigurationSelection {
     return this.diagnosticsConfigurations.select(workspaceConfiguration);
+  }
+
+  getThinkingDiagnosticLines(configuredLevels?: unknown): string[] {
+    return thinkingDiagnosticLines(this.lastProvidedModels, configuredLevels);
   }
 
   async provideLanguageModelChatInformation(
@@ -203,13 +212,15 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           `Providing ${models.length} Ollama model(s) from ${configuration.url}${versionSuffix}${recommendationSuffix}.`
         );
 
-        return hydratedModels.map(({ model, show }) => this.toLanguageModel(
+        const languageModels = hydratedModels.map(({ model, show }) => this.toLanguageModel(
           model,
           show,
           configuration,
           recommendedReplacement(model.name, availableModels, recommendations),
           isRecommendedModel(model.name, recommendations)
         ));
+        this.lastProvidedModels = languageModels;
+        return languageModels;
       } catch (error) {
         throw this.userFacingError(error);
       }
@@ -538,8 +549,14 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     const name = model.name;
     const id = modelIdentifier(model);
     const family = modelFamily(model, show);
+    const hasServerThinkingMetadata = show?.thinking !== undefined
+      && typeof show.thinking === 'object'
+      && show.thinking !== null;
     const policy = hasCapability(capabilities, 'thinking', 'reasoning')
       ? thinkingPolicy(id, family, show?.thinking)
+      : undefined;
+    const defaultSource = policy
+      ? (hasServerThinkingMetadata ? 'server' : 'compatibility')
       : undefined;
     const { maxInputTokens, maxOutputTokens } = modelTokenLimits(model, show);
 
@@ -560,6 +577,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       headers: configuration.headers,
       local: !isRemoteModel(model) && !isCloudModel(id),
       thinkingPolicy: policy,
+      defaultSource,
       recommendedReplacement: replacement
     };
   }

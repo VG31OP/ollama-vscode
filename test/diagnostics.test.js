@@ -5,7 +5,8 @@ const {
   loadedModelContextDiagnosticLines,
   maximumSupportedContextLength,
   OllamaDiagnosticsConfigurationTracker,
-  ollamaDiagnosticsClientOptions
+  ollamaDiagnosticsClientOptions,
+  thinkingDiagnosticLines
 } = require('../out/diagnostics');
 
 test('uses the most recently resolved provider group when the workspace endpoint differs', () => {
@@ -193,4 +194,86 @@ test('reads maximum context only from model metadata supplied separately from th
   assert.equal(maximumSupportedContextLength({
     model_info: { 'gemma3.context_length': 131072 }
   }), 131072);
+});
+
+test('formats thinking diagnostics with server-advertised default and effective setting for next request', () => {
+  const models = [{
+    model: 'server/qwen3.8:27b',
+    thinkingPolicy: { levels: [false, 'low', 'medium', 'xhigh'], defaultLevel: 'medium' },
+    defaultSource: 'server'
+  }];
+  const lines = thinkingDiagnosticLines(models, { 'server/qwen3.8:27b': 'low' });
+
+  assert.deepEqual(lines, [
+    'Thinking settings:',
+    '- server/qwen3.8:27b: supported values: [false, "low", "medium", "xhigh"]; server-advertised default: "medium"; configured override: "low"; effective setting for next request: "low"'
+  ]);
+});
+
+test('distinguishes compatibility fallback defaults and explains omitted think when override is unset', () => {
+  const models = [{
+    model: 'gpt-oss:20b',
+    thinkingPolicy: { levels: ['low', 'medium', 'high'], defaultLevel: 'medium' },
+    defaultSource: 'compatibility'
+  }];
+  const lines = thinkingDiagnosticLines(models, {});
+
+  assert.deepEqual(lines, [
+    'Thinking settings:',
+    '- gpt-oss:20b: supported values: ["low", "medium", "high"]; compatibility fallback default: "medium"; configured override: none; think will be omitted to use server default'
+  ]);
+});
+
+test('explains why an unsupported override is ignored and that think will be omitted', () => {
+  const models = [{
+    model: 'deepseek-v4-flash:cloud',
+    thinkingPolicy: { levels: [false, 'high', 'max'], defaultLevel: false },
+    defaultSource: 'compatibility'
+  }];
+  const lines = thinkingDiagnosticLines(models, { 'deepseek-v4-flash:cloud': 'low' });
+
+  assert.deepEqual(lines, [
+    'Thinking settings:',
+    '- deepseek-v4-flash:cloud: supported values: [false, "high", "max"]; compatibility fallback default: false; configured override: "low" (unsupported, ignored); think will be omitted to use server default'
+  ]);
+});
+
+test('supports boolean configured thinking overrides', () => {
+  const models = [{
+    model: 'deepseek-v4-flash:cloud',
+    thinkingPolicy: { levels: [false, 'high', 'max'], defaultLevel: false },
+    defaultSource: 'compatibility'
+  }];
+  const lines = thinkingDiagnosticLines(models, { 'deepseek-v4-flash:cloud': false });
+
+  assert.deepEqual(lines, [
+    'Thinking settings:',
+    '- deepseek-v4-flash:cloud: supported values: [false, "high", "max"]; compatibility fallback default: false; configured override: false; effective setting for next request: false'
+  ]);
+});
+
+test('flags non-thinking models with configured overrides and returns empty when no thinking models exist', () => {
+  const nonThinking = [{ model: 'llama3:8b' }];
+  assert.deepEqual(thinkingDiagnosticLines(nonThinking, {}), []);
+
+  const linesWithOverride = thinkingDiagnosticLines(nonThinking, { 'llama3:8b': 'high' });
+  assert.deepEqual(linesWithOverride, [
+    'Thinking settings:',
+    '- llama3:8b: model does not support thinking; configured override: "high" (ignored); think will be omitted'
+  ]);
+});
+
+test('handles malformed thinking levels gracefully', () => {
+  const models = [{
+    model: 'gpt-oss:20b',
+    thinkingPolicy: { levels: ['low', 'medium', 'high'], defaultLevel: 'medium' },
+    defaultSource: 'compatibility'
+  }];
+  for (const malformed of [null, undefined, false, 'invalid', [1, 2]]) {
+    const lines = thinkingDiagnosticLines(models, malformed);
+    assert.deepEqual(lines, [
+      'Thinking settings:',
+      '- gpt-oss:20b: supported values: ["low", "medium", "high"]; compatibility fallback default: "medium"; configured override: none; think will be omitted to use server default'
+    ]);
+  }
 });

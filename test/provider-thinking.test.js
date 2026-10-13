@@ -268,3 +268,33 @@ test('matches older-server fallback policies using the request identifier instea
     provider.dispose();
   }
 });
+
+test('provides thinking diagnostics through provider agreeing with request configuration', async () => {
+  models = [
+    {
+      name: 'Qwen Display',
+      model: 'server/qwen3.8:27b',
+      capabilities: ['thinking'],
+      remote_host: 'ollama.com',
+      show: { thinking: { values: [false, 'low', 'medium'], default: 'medium' } }
+    },
+    {
+      name: 'gpt-oss:20b',
+      capabilities: ['thinking'],
+      remote_host: 'ollama.com'
+    }
+  ];
+  settings.thinkingLevels = { 'server/qwen3.8:27b': 'low' };
+  const provider = new OllamaLanguageModelProvider();
+  try {
+    await provider.provideLanguageModelChatInformation({}, cancellationToken);
+    const lines = provider.getThinkingDiagnosticLines(settings.thinkingLevels);
+    assert.deepEqual(lines, [
+      'Thinking settings:',
+      '- server/qwen3.8:27b: supported values: [false, "low", "medium"]; server-advertised default: "medium"; configured override: "low"; effective setting for next request: "low"',
+      '- gpt-oss:20b: supported values: ["low", "medium", "high"]; compatibility fallback default: "medium"; configured override: none; think will be omitted to use server default'
+    ]);
+  } finally {
+    provider.dispose();
+  }
+});

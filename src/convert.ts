@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { types } from 'node:util';
 import { OllamaChatMessage, OllamaTool } from './provider';
 
 export function toOllamaMessages(messages: readonly vscode.LanguageModelChatRequestMessage[]): OllamaChatMessage[] {
@@ -128,18 +129,22 @@ export function isTextPart(part: unknown): part is vscode.LanguageModelTextPart 
     'value' in part &&
     typeof (part as { value: unknown }).value === 'string' &&
     !('callId' in part) &&
-    !('mimeType' in part)
+    !('mimeType' in part) &&
+    // Thinking parts also have a value; serialized VS Code parts need revival.
+    !('id' in part) &&
+    !('metadata' in part) &&
+    !('$mid' in part)
   );
 }
 
 export function isDataPart(part: unknown): part is vscode.LanguageModelDataPart {
-  return part instanceof vscode.LanguageModelDataPart || (
+  return (
     typeof part === 'object' &&
     part !== null &&
     'mimeType' in part &&
     typeof (part as { mimeType: unknown }).mimeType === 'string' &&
     'data' in part &&
-    (part as { data: unknown }).data != null
+    types.isUint8Array((part as { data: unknown }).data)
   );
 }
 

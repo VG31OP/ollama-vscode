@@ -1,10 +1,19 @@
 const assert = require('node:assert/strict');
 const Module = require('node:module');
 const test = require('node:test');
+const { runInNewContext } = require('node:vm');
 
 class LanguageModelTextPart {
   constructor(value) {
     this.value = value;
+  }
+}
+
+class LanguageModelThinkingPart {
+  constructor(value, id, metadata) {
+    this.value = value;
+    this.id = id;
+    this.metadata = metadata;
   }
 }
 
@@ -154,7 +163,7 @@ test('forwards image data from tool results on the corresponding tool message', 
   }]);
 });
 
-test('converts plain and cross-realm message parts that do not inherit from vscode classes', () => {
+test('converts plain message parts that do not inherit from vscode classes', () => {
   const plainTextPart = { value: 'Hello from remote host' };
   const plainDataPart = { mimeType: 'text/plain', data: new TextEncoder().encode('decoded note') };
   const plainToolCallPart = {
@@ -196,6 +205,67 @@ test('converts plain and cross-realm message parts that do not inherit from vsco
       tool_call_id: 'call-5'
     }
   ]);
+});
+
+test('preserves foreign-realm text, byte arrays, and nested tool results', () => {
+  const messages = runInNewContext(`(() => {
+    class TextPart { constructor(value) { this.value = value; } }
+    class DataPart {
+      constructor(data, mimeType) { this.data = data; this.mimeType = mimeType; }
+    }
+    const image = new DataPart(new Uint8Array([9, 1, 2, 3, 9]).subarray(1, 4), 'image/png');
+    return [
+      { role: 1, content: [new TextPart('hello'), new DataPart(new Uint8Array([104, 105]), 'text/plain'), image] },
+      { role: 2, content: [{ callId: 'foreign-call', name: 'lookup', input: {} }] },
+      { role: 1, content: [{ callId: 'foreign-call', content: [new TextPart('result'), image] }] }
+    ];
+  })()`);
+
+  assert.equal(messages[0].content[0] instanceof LanguageModelTextPart, false);
+  assert.equal(messages[0].content[1].data instanceof Uint8Array, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(toOllamaMessages(messages))), [
+    { role: 'user', content: 'hello\nhi', images: ['AQID'] },
+    { role: 'assistant', content: '',
+      tool_calls: [{ id: 'foreign-call', function: { name: 'lookup', arguments: {} } }] },
+    { role: 'tool', content: 'result', images: ['AQID'], tool_call_id: 'foreign-call' }
+  ]);
+});
+
+test('excludes thinking and unrevived serialized parts from ordinary text', () => {
+  const thinking = new LanguageModelThinkingPart('private thinking');
+  const parts = [
+    thinking,
+    new LanguageModelThinkingPart('private thinking', 'thinking-id', { signature: 'fixture' }),
+    structuredClone(thinking),
+    // The marshalling marker distinguishes serialized parts even without id/metadata.
+    { $mid: 999, value: 'serialized thinking' }
+  ];
+  for (const part of parts) {
+    assert.equal(isTextPart(part), false);
+    assert.deepEqual(toOllamaMessages([{
+      role: 2, content: [part, new LanguageModelTextPart('answer')]
+    }]), [{ role: 'assistant', content: 'answer', images: undefined, tool_calls: undefined }]);
+  }
+});
+
+test('requires byte arrays instead of treating serialized data as runtime media', () => {
+  for (const mimeType of ['image/png', 'text/plain', 'application/json']) {
+    const serialized = JSON.parse(JSON.stringify(new LanguageModelDataPart(new Uint8Array([1, 2, 3]), mimeType)));
+    for (const part of [
+      serialized,
+      { mimeType, data: JSON.parse(JSON.stringify(new Uint8Array([1, 2, 3]))) },
+      new LanguageModelDataPart(serialized.data, mimeType)
+    ]) {
+      assert.equal(isDataPart(part), false);
+      assert.deepEqual(toOllamaMessages([{ role: 1, content: [part] }]), []);
+      // Preserve the existing JSON fallback for unrecognized tool-result values.
+      assert.equal(toOllamaMessages([{
+        role: 1, content: [new LanguageModelToolResultPart('serialized-call', [part])]
+      }])[0].content, JSON.stringify(part));
+    }
+  }
+  assert.equal(isDataPart({ mimeType: 'image/png', data: Buffer.from([1, 2, 3]) }), true);
+  assert.equal(isDataPart({ mimeType: 'image/png', data: new Uint16Array([1, 2, 3]) }), false);
 });
 
 test('structural type guards identify plain objects and reject mismatched shapes', () => {

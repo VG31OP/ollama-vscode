@@ -124,12 +124,13 @@ test('preserves text, supported JSON data, and JSON-compatible tool result conte
     new LanguageModelDataPart(new TextEncoder().encode('second'), 'text/plain'),
     new LanguageModelDataPart(new TextEncoder().encode('{"status":"ok"}'), 'application/json; charset=utf-8'),
     new LanguageModelDataPart(new TextEncoder().encode('{"vendor":true}'), 'application/vnd.example+json'),
-    { legacy: true }
+    { legacy: true },
+    { value: '42', unit: 'ms', source: 'synthetic timer' }
   ]);
 
   assert.deepEqual(toOllamaMessages([{ role: 1, content: [result] }]), [{
     role: 'tool',
-    content: 'first\nsecond\n{"status":"ok"}\n{"vendor":true}\n{"legacy":true}',
+    content: 'first\nsecond\n{"status":"ok"}\n{"vendor":true}\n{"legacy":true}\n{"value":"42","unit":"ms","source":"synthetic timer"}',
     tool_call_id: 'call-3'
   }]);
 });
@@ -164,7 +165,7 @@ test('forwards image data from tool results on the corresponding tool message', 
 });
 
 test('converts plain message parts that do not inherit from vscode classes', () => {
-  const plainTextPart = { value: 'Hello from remote host' };
+  const plainTextPart = { value: 'Hello from remote host', audience: [0] };
   const plainDataPart = { mimeType: 'text/plain', data: new TextEncoder().encode('decoded note') };
   const plainToolCallPart = {
     callId: 'call-5',
@@ -209,7 +210,9 @@ test('converts plain message parts that do not inherit from vscode classes', () 
 
 test('preserves foreign-realm text, byte arrays, and nested tool results', () => {
   const messages = runInNewContext(`(() => {
-    class TextPart { constructor(value) { this.value = value; } }
+    class TextPart {
+      constructor(value, audience) { this.value = value; this.audience = audience; }
+    }
     class DataPart {
       constructor(data, mimeType) { this.data = data; this.mimeType = mimeType; }
     }
@@ -217,7 +220,7 @@ test('preserves foreign-realm text, byte arrays, and nested tool results', () =>
     return [
       { role: 1, content: [new TextPart('hello'), new DataPart(new Uint8Array([104, 105]), 'text/plain'), image] },
       { role: 2, content: [{ callId: 'foreign-call', name: 'lookup', input: {} }] },
-      { role: 1, content: [{ callId: 'foreign-call', content: [new TextPart('result'), image] }] }
+      { role: 1, content: [{ callId: 'foreign-call', content: [new TextPart('result', [0]), image] }] }
     ];
   })()`);
 

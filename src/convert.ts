@@ -133,7 +133,9 @@ export function isTextPart(part: unknown): part is vscode.LanguageModelTextPart 
     // Thinking parts also have a value; serialized VS Code parts need revival.
     !('id' in part) &&
     !('metadata' in part) &&
-    !('$mid' in part)
+    !('$mid' in part) &&
+    // Preserve arbitrary JSON tool results with a value and additional fields.
+    Object.keys(part).every(key => key === 'value' || key === 'audience')
   );
 }
 

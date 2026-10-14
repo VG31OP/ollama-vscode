@@ -291,21 +291,23 @@ export function thinkingDiagnosticLines(
   configuredThinkingLevels?: unknown
 ): string[] {
   const configuredMap = isRecord(configuredThinkingLevels) ? configuredThinkingLevels : undefined;
-  const thinkingModels = models.filter(model => model.thinkingPolicy !== undefined);
-  const nonThinkingWithOverride = models.filter(
-    model => model.thinkingPolicy === undefined && configuredMap && Object.hasOwn(configuredMap, model.model)
-  );
-
-  if (thinkingModels.length === 0 && nonThinkingWithOverride.length === 0) {
+  if (models.length === 0) {
     return [];
   }
 
   const lines: string[] = ['Thinking settings:'];
-  for (const model of thinkingModels) {
-    const policy = model.thinkingPolicy!;
+  for (const model of models) {
+    const policy = model.thinkingPolicy;
     const rawOverride = configuredMap && Object.hasOwn(configuredMap, model.model)
       ? configuredMap[model.model]
       : undefined;
+    if (!policy) {
+      const override = rawOverride === undefined ? 'none' : `${formatThinkingValue(rawOverride)} (ignored)`;
+      lines.push(
+        `- ${model.model}: configurable thinking values unavailable; configured override: ${override}; think will be omitted to use server default`
+      );
+      continue;
+    }
     const effective = supportedThinkingLevel(policy, rawOverride);
     const defaultLabel = model.defaultSource === 'server'
       ? `server-advertised default: ${formatThinkingValue(policy.defaultLevel)}`
@@ -325,13 +327,6 @@ export function thinkingDiagnosticLines(
     }
 
     lines.push(`- ${model.model}: ${supportedList}; ${defaultLabel}; ${overrideStatus}`);
-  }
-
-  for (const model of nonThinkingWithOverride) {
-    const rawOverride = configuredMap![model.model];
-    lines.push(
-      `- ${model.model}: model does not support thinking; configured override: ${formatThinkingValue(rawOverride)} (ignored); think will be omitted`
-    );
   }
 
   return lines;

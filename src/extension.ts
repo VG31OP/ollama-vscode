@@ -31,6 +31,7 @@ async function diagnoseModels(output: vscode.OutputChannel, provider: OllamaLang
   output.show(true);
   output.appendLine('--- Diagnostics ---');
 
+  provider.resetThinkingDiagnostics();
   const allVSCodeModels = await vscode.lm.selectChatModels();
   output.appendLine(`VS Code returned ${allVSCodeModels.length} total language model(s).`);
   for (const model of allVSCodeModels) {

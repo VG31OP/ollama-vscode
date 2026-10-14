@@ -252,14 +252,18 @@ test('supports boolean configured thinking overrides', () => {
   ]);
 });
 
-test('flags non-thinking models with configured overrides and returns empty when no thinking models exist', () => {
+test('explains unavailable overrides without inferring that a model cannot think', () => {
   const nonThinking = [{ model: 'llama3:8b' }];
-  assert.deepEqual(thinkingDiagnosticLines(nonThinking, {}), []);
+  assert.deepEqual(thinkingDiagnosticLines([], {}), []);
+  assert.deepEqual(thinkingDiagnosticLines(nonThinking, {}), [
+    'Thinking settings:',
+    '- llama3:8b: configurable thinking values unavailable; configured override: none; think will be omitted to use server default'
+  ]);
 
   const linesWithOverride = thinkingDiagnosticLines(nonThinking, { 'llama3:8b': 'high' });
   assert.deepEqual(linesWithOverride, [
     'Thinking settings:',
-    '- llama3:8b: model does not support thinking; configured override: "high" (ignored); think will be omitted'
+    '- llama3:8b: configurable thinking values unavailable; configured override: "high" (ignored); think will be omitted to use server default'
   ]);
 });
 

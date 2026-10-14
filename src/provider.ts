@@ -152,18 +152,22 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   private readonly outdatedModelWarnings = new OutdatedModelWarningTracker();
   private readonly machineContextWarnings = new Set<string>();
   private readonly diagnosticsConfigurations = new OllamaDiagnosticsConfigurationTracker();
-  private lastProvidedModels: OllamaLanguageModel[] = [];
+  private readonly thinkingDiagnosticGroups = new Map<string, {
+    url: string;
+    models: ThinkingDiagnosticModel[];
+  }>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
 
   constructor(private readonly output?: vscode.OutputChannel) {}
 
   refresh() {
+    this.resetThinkingDiagnostics();
     this.output?.appendLine('Refreshing Ollama language models.');
     this.changeEmitter.fire();
   }
 
   dispose() {
-    this.lastProvidedModels = [];
+    this.resetThinkingDiagnostics();
     this.changeEmitter.dispose();
   }
 
@@ -173,8 +177,17 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     return this.diagnosticsConfigurations.select(workspaceConfiguration);
   }
 
+  resetThinkingDiagnostics() {
+    this.thinkingDiagnosticGroups.clear();
+  }
+
   getThinkingDiagnosticLines(configuredLevels?: unknown): string[] {
-    return thinkingDiagnosticLines(this.lastProvidedModels, configuredLevels);
+    return [...this.thinkingDiagnosticGroups.values()].flatMap(group => {
+      const lines = thinkingDiagnosticLines(group.models, configuredLevels);
+      return lines.length > 0
+        ? [`Thinking settings for ${diagnosticEndpoint(group.url)}:`, ...lines.slice(1)]
+        : [];
+    });
   }
 
   async provideLanguageModelChatInformation(
@@ -182,6 +195,8 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     token: vscode.CancellationToken
   ): Promise<OllamaLanguageModel[]> {
     const configuration = getConfiguration(options);
+    const diagnosticsKey = JSON.stringify(configuration);
+    this.thinkingDiagnosticGroups.delete(diagnosticsKey);
     this.diagnosticsConfigurations.recordResolved(configuration);
     const disposables: vscode.Disposable[] = [];
     const request = createFetch(token, disposables);
@@ -219,7 +234,10 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           recommendedReplacement(model.name, availableModels, recommendations),
           isRecommendedModel(model.name, recommendations)
         ));
-        this.lastProvidedModels = languageModels;
+        this.thinkingDiagnosticGroups.set(diagnosticsKey, {
+          url: configuration.url,
+          models: languageModels
+        });
         return languageModels;
       } catch (error) {
         throw this.userFacingError(error);
@@ -787,6 +805,16 @@ function shouldHydrateModel(model: OllamaTagsModel): boolean {
 
 function isRemoteModel(model: OllamaTagsModel): boolean {
   return typeof model.remote_host === 'string' && model.remote_host.length > 0;
+}
+
+function diagnosticEndpoint(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    // Identify the server without exposing URL credentials or query parameters.
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return 'the configured Ollama server';
+  }
 }
 
 function getConfiguredHeaders(

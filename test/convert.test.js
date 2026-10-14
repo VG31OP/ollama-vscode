@@ -48,10 +48,21 @@ Module._load = function(request, parent, isMain) {
   return originalLoad.call(this, request, parent, isMain);
 };
 
+let isDataPart;
+let isTextPart;
+let isToolCallPart;
+let isToolResultPart;
 let toOllamaMessages;
 let toOllamaTools;
 try {
-  ({ toOllamaMessages, toOllamaTools } = require('../out/convert'));
+  ({
+    isDataPart,
+    isTextPart,
+    isToolCallPart,
+    isToolResultPart,
+    toOllamaMessages,
+    toOllamaTools
+  } = require('../out/convert'));
 } finally {
   Module._load = originalLoad;
 }
@@ -141,4 +152,67 @@ test('forwards image data from tool results on the corresponding tool message', 
     images: [Buffer.from(imageBytes).toString('base64')],
     tool_call_id: 'call-4'
   }]);
+});
+
+test('converts plain and cross-realm message parts that do not inherit from vscode classes', () => {
+  const plainTextPart = { value: 'Hello from remote host' };
+  const plainDataPart = { mimeType: 'text/plain', data: new TextEncoder().encode('decoded note') };
+  const plainToolCallPart = {
+    callId: 'call-5',
+    name: 'fetch_docs',
+    input: { query: 'ollama' }
+  };
+  const plainToolResultPart = {
+    callId: 'call-5',
+    content: [{ value: 'result text' }]
+  };
+
+  assert.deepEqual(toOllamaMessages([
+    { role: 1, content: [plainTextPart, plainDataPart] },
+    { role: 2, content: [plainToolCallPart] },
+    { role: 1, content: [plainToolResultPart] }
+  ]), [
+    {
+      role: 'user',
+      content: 'Hello from remote host\ndecoded note',
+      images: undefined,
+      tool_calls: undefined
+    },
+    {
+      role: 'assistant',
+      content: '',
+      images: undefined,
+      tool_calls: [{
+        id: 'call-5',
+        function: {
+          name: 'fetch_docs',
+          arguments: { query: 'ollama' }
+        }
+      }]
+    },
+    {
+      role: 'tool',
+      content: 'result text',
+      tool_call_id: 'call-5'
+    }
+  ]);
+});
+
+test('structural type guards identify plain objects and reject mismatched shapes', () => {
+  assert.equal(isTextPart({ value: 'hello' }), true);
+  assert.equal(isTextPart(new LanguageModelTextPart('hello')), true);
+  assert.equal(isTextPart({ value: 123 }), false);
+  assert.equal(isTextPart({ callId: '1', name: 'tool' }), false);
+  assert.equal(isTextPart(null), false);
+
+  assert.equal(isDataPart({ mimeType: 'text/plain', data: new Uint8Array() }), true);
+  assert.equal(isDataPart(new LanguageModelDataPart(new Uint8Array(), 'image/png')), true);
+  assert.equal(isDataPart({ mimeType: 'text/plain' }), false);
+  assert.equal(isDataPart({ data: new Uint8Array() }), false);
+
+  assert.equal(isToolCallPart({ callId: 'c1', name: 't1', input: {} }), true);
+  assert.equal(isToolCallPart({ callId: 'c1', content: [] }), false);
+
+  assert.equal(isToolResultPart({ callId: 'c1', content: [] }), true);
+  assert.equal(isToolResultPart({ callId: 'c1', name: 't1' }), false);
 });

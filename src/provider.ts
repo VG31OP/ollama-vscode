@@ -474,7 +474,13 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     if (isAuthError(error)) {
       return new Error('Run ollama signin and try again.');
     }
-    return error instanceof Error ? error : new Error(String(error));
+    if (error instanceof Error) {
+      if (error.cause && typeof error.cause === 'object' && 'message' in error.cause && typeof error.cause.message === 'string') {
+        return new Error(`${error.message}: ${error.cause.message}`);
+      }
+      return error;
+    }
+    return new Error(String(error));
   }
 
   private async confirmOutdatedModelUse(
@@ -950,7 +956,13 @@ function isCloudModel(model: string): boolean {
 }
 
 function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) {
+    if (error.cause && typeof error.cause === 'object' && 'message' in error.cause && typeof error.cause.message === 'string') {
+      return `${error.message}: ${error.cause.message}`;
+    }
+    return error.message;
+  }
+  return String(error);
 }
 
 function partToText(part: vscode.LanguageModelInputPart | unknown): string {

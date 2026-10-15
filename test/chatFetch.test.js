@@ -182,6 +182,49 @@ test('enforces a finite response header timeout', async () => {
   });
 });
 
+test('disables body timeout by default to allow long streaming responses', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'text/plain' });
+    response.write('part1');
+    setTimeout(() => {
+      response.write('part2');
+      response.end();
+    }, 150);
+  }, async url => {
+    const transport = createChatFetch(1000);
+    try {
+      const response = await transport.fetch(`${url}/api/chat`);
+      assert.strictEqual(response.status, 200);
+      assert.strictEqual(await response.text(), 'part1part2');
+    } finally {
+      transport.dispose();
+    }
+  });
+});
+
+test('enforces an explicit body timeout when configured', async () => {
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'Content-Type': 'text/plain' });
+    response.flushHeaders();
+    setTimeout(() => {
+      response.end('too late');
+    }, 1500);
+  }, async url => {
+    const transport = createChatFetch(2000, undefined, 100);
+    try {
+      const response = await transport.fetch(`${url}/api/chat`);
+      await assert.rejects(
+        response.text(),
+        error => error.cause?.code === 'UND_ERR_BODY_TIMEOUT' || error.code === 'UND_ERR_BODY_TIMEOUT'
+      );
+    } finally {
+      transport.dispose();
+    }
+  });
+});
+
 test('links VS Code cancellation to the chat request', async () => {
   let requestClosed;
   let markRequestStarted;

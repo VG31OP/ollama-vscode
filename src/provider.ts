@@ -34,7 +34,9 @@ import {
 import {
   OllamaDiagnosticsConfigurationTracker,
   type OllamaDiagnosticsConfiguration,
-  type OllamaDiagnosticsConfigurationSelection
+  type OllamaDiagnosticsConfigurationSelection,
+  thinkingDiagnosticLines,
+  type ThinkingDiagnosticModel
 } from './diagnostics';
 import {
   supportedThinkingLevel,
@@ -55,6 +57,7 @@ interface OllamaLanguageModel extends vscode.LanguageModelChatInformation {
   headers: Record<string, string>;
   local: boolean;
   thinkingPolicy?: ThinkingPolicy;
+  defaultSource?: 'server' | 'compatibility';
   recommendedReplacement?: string;
 }
 
@@ -152,18 +155,24 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   private readonly machineContextWarnings = new Set<string>();
   private readonly diagnosticsConfigurations = new OllamaDiagnosticsConfigurationTracker();
   private recoveredContextLengths = new Map<string, number>();
+  private readonly thinkingDiagnosticGroups = new Map<string, {
+    url: string;
+    models: ThinkingDiagnosticModel[];
+  }>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
 
   constructor(private readonly output?: vscode.OutputChannel) {}
 
   refresh() {
     this.recoveredContextLengths = new Map();
+    this.resetThinkingDiagnostics();
     this.output?.appendLine('Refreshing Ollama language models.');
     this.changeEmitter.fire();
   }
 
   dispose() {
     this.recoveredContextLengths = new Map();
+    this.resetThinkingDiagnostics();
     this.changeEmitter.dispose();
   }
 
@@ -173,11 +182,26 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     return this.diagnosticsConfigurations.select(workspaceConfiguration);
   }
 
+  resetThinkingDiagnostics() {
+    this.thinkingDiagnosticGroups.clear();
+  }
+
+  getThinkingDiagnosticLines(configuredLevels?: unknown): string[] {
+    return [...this.thinkingDiagnosticGroups.values()].flatMap(group => {
+      const lines = thinkingDiagnosticLines(group.models, configuredLevels);
+      return lines.length > 0
+        ? [`Thinking settings for ${diagnosticEndpoint(group.url)}:`, ...lines.slice(1)]
+        : [];
+    });
+  }
+
   async provideLanguageModelChatInformation(
     options: vscode.PrepareLanguageModelChatModelOptions,
     token: vscode.CancellationToken
   ): Promise<OllamaLanguageModel[]> {
     const configuration = getConfiguration(options);
+    const diagnosticsKey = JSON.stringify(configuration);
+    this.thinkingDiagnosticGroups.delete(diagnosticsKey);
     this.diagnosticsConfigurations.recordResolved(configuration);
     const disposables: vscode.Disposable[] = [];
     const request = createFetch(token, disposables);
@@ -208,13 +232,18 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           `Providing ${models.length} Ollama model(s) from ${configuration.url}${versionSuffix}${recommendationSuffix}.`
         );
 
-        return hydratedModels.map(({ model, show }) => this.toLanguageModel(
+        const languageModels = hydratedModels.map(({ model, show }) => this.toLanguageModel(
           model,
           show,
           configuration,
           recommendedReplacement(model.name, availableModels, recommendations),
           isRecommendedModel(model.name, recommendations)
         ));
+        this.thinkingDiagnosticGroups.set(diagnosticsKey, {
+          url: configuration.url,
+          models: languageModels
+        });
+        return languageModels;
       } catch (error) {
         throw this.userFacingError(error);
       }
@@ -533,7 +562,13 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     if (isAuthError(error)) {
       return new Error('Run ollama signin and try again.');
     }
-    return error instanceof Error ? error : new Error(String(error));
+    if (error instanceof Error) {
+      if (error.cause && typeof error.cause === 'object' && 'message' in error.cause && typeof error.cause.message === 'string') {
+        return new Error(`${error.message}: ${error.cause.message}`);
+      }
+      return error;
+    }
+    return new Error(String(error));
   }
 
   private async confirmOutdatedModelUse(
@@ -597,8 +632,14 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     const name = model.name;
     const id = modelIdentifier(model);
     const family = modelFamily(model, show);
+    const hasServerThinkingMetadata = show?.thinking !== undefined
+      && typeof show.thinking === 'object'
+      && show.thinking !== null;
     const policy = hasCapability(capabilities, 'thinking', 'reasoning')
       ? thinkingPolicy(id, family, show?.thinking)
+      : undefined;
+    const defaultSource = policy
+      ? (hasServerThinkingMetadata ? 'server' : 'compatibility')
       : undefined;
     const { maxInputTokens, maxOutputTokens } = modelTokenLimits(model, show);
 
@@ -619,6 +660,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       headers: configuration.headers,
       local: !isRemoteModel(model) && !isCloudModel(id),
       thinkingPolicy: policy,
+      defaultSource,
       recommendedReplacement: replacement
     };
   }
@@ -830,6 +872,16 @@ function isRemoteModel(model: OllamaTagsModel): boolean {
   return typeof model.remote_host === 'string' && model.remote_host.length > 0;
 }
 
+function diagnosticEndpoint(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    // Identify the server without exposing URL credentials or query parameters.
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return 'the configured Ollama server';
+  }
+}
+
 function getConfiguredHeaders(
   configuration: { readonly [key: string]: unknown } | undefined,
   settings: vscode.WorkspaceConfiguration
@@ -1009,7 +1061,13 @@ function isCloudModel(model: string): boolean {
 }
 
 function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) {
+    if (error.cause && typeof error.cause === 'object' && 'message' in error.cause && typeof error.cause.message === 'string') {
+      return `${error.message}: ${error.cause.message}`;
+    }
+    return error.message;
+  }
+  return String(error);
 }
 
 function partToText(part: vscode.LanguageModelInputPart | unknown): string {

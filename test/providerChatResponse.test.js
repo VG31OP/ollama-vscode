@@ -352,127 +352,230 @@ test('preserves and surfaces an unsupported tool schema without retrying', async
   });
 });
 
-test('dynamically allocates num_ctx for requests exceeding default context', async () => {
-  let chatBody;
-  await withServer(async (request, response) => {
-    let body = '';
-    for await (const chunk of request) {
-      body += chunk;
-    }
-    chatBody = JSON.parse(body);
-    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
-    response.end(JSON.stringify({ message: { content: 'Dynamic context response' }, done: true }) + '\n');
-  }, async url => {
-    const provider = new OllamaLanguageModelProvider();
-    const model = {
-      id: 'qwen2.5:32b',
-      name: 'qwen2.5:32b',
-      model: 'qwen2.5:32b',
-      url,
-      headers: {},
-      local: false,
-      maxInputTokens: 28672,
-      maxOutputTokens: 4096
-    };
-    // 20000 characters ≈ 5000 tokens (with default 4 chars/token)
-    // 5000 prompt + 4096 output = 9096 -> rounds up to 10240 (10 * 1024)
-    const text = 'a'.repeat(20000);
-    const messages = [{
-      role: vscode.LanguageModelChatMessageRole.User,
-      content: [new LanguageModelTextPart(text)]
-    }];
-    const progress = collectProgress();
-    const token = cancellationTokenSource().token;
-    try {
-      await provider.provideLanguageModelChatResponse(model, messages, {}, progress, token);
-      assert.equal(chatBody.options?.num_ctx, 9216);
-      assert.equal(progress.reports[0].value, 'Dynamic context response');
-    } finally {
-      provider.dispose();
-    }
+const contextModel = {
+  id: 'test-model', name: 'test-model', model: 'test-model', headers: {}, local: true,
+  maxInputTokens: 28672, maxOutputTokens: 4096
+};
+const contextMessages = [
+  { role: 1, content: [new LanguageModelTextPart('a'.repeat(20000)),
+    new LanguageModelDataPart(new Uint8Array([1, 2, 3]), 'image/png')] },
+  { role: 2, content: [new LanguageModelToolCallPart('read-1', 'read_file', { path: 'app.ts' })] },
+  { role: 1, content: [new LanguageModelToolResultPart('read-1', [new LanguageModelTextPart('b'.repeat(48000))])] }
+];
+
+for (const local of [true, false]) {
+  test(`preserves server context for large ${local ? 'local' : 'cloud'} requests with tool history`, async () => {
+    await withContextServer((response) => {
+      response.end(JSON.stringify({ message: { content: 'Hello' }, done: true }) + '\n');
+    }, async (url, requests) => {
+      const provider = new OllamaLanguageModelProvider();
+      try {
+        for (const messages of [contextMessages, [...contextMessages, { role: 1, content: [new LanguageModelTextPart('c'.repeat(4000))] }]]) {
+          await provider.provideLanguageModelChatResponse(
+            { ...contextModel, url, local }, messages, { modelOptions: { temperature: 0.2 } },
+            collectProgress(), cancellationTokenSource().token
+          );
+        }
+        assert.deepEqual(requests.map(request => request.options), [{ temperature: 0.2 }, { temperature: 0.2 }]);
+        assert.deepEqual(requests[0].messages, [
+          { role: 'user', content: 'a'.repeat(20000), images: ['AQID'] },
+          { role: 'assistant', content: '', tool_calls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'app.ts' } } }] },
+          { role: 'tool', content: 'b'.repeat(48000), tool_call_id: 'read-1' }
+        ]);
+      } finally {
+        provider.dispose();
+      }
+    });
   });
+}
+
+test('retries the complete request and checks the context loaded by the retry', { timeout: 5000 }, async () => {
+  const warnings = [];
+  const originalWarning = vscode.window.showWarningMessage;
+  vscode.window.showWarningMessage = async message => { warnings.push(message); };
+  let loadedContext = 4096;
+  let retryStarted = false;
+  let checkedDuringRetry;
+  const retryCheck = new Promise(resolve => { checkedDuringRetry = resolve; });
+  try {
+    await withContextServer(async (response, body, attempt) => {
+      if (attempt === 1) {
+        response.writeHead(400);
+        response.end(JSON.stringify({ error: 'request (70000 tokens) exceeds the available context size (4096 tokens)' }));
+        return;
+      }
+      retryStarted = true;
+      await retryCheck;
+      loadedContext = body.options.num_ctx;
+      response.end(JSON.stringify({ message: { content: 'Recovered' }, done: true }) + '\n');
+    }, async (url, requests) => {
+      const provider = new OllamaLanguageModelProvider();
+      const model = { ...contextModel, url, maxInputTokens: 126976,
+        thinkingPolicy: { levels: [false, 'medium'], defaultLevel: false } };
+      settings.thinkingLevels = { [model.model]: 'medium' };
+      const options = { modelOptions: { temperature: 0.2 }, tools: [{ name: 'read_file', inputSchema: { type: 'object' } }] };
+      const progress = collectProgress();
+      try {
+        await provider.provideLanguageModelChatResponse(model, contextMessages, options, progress, cancellationTokenSource().token);
+        assert.equal(requests.length, 2);
+        assert.equal(requests[0].think, 'medium');
+        assert.equal(requests[0].tools[0].function.name, 'read_file');
+        assert.deepEqual(requests[1], { ...requests[0], options: { temperature: 0.2, num_ctx: 74752 } });
+        assert.deepEqual(options.modelOptions, { temperature: 0.2 });
+        assert.equal(progress.reports[0].value, 'Recovered');
+        assert.deepEqual(warnings, []);
+      } finally {
+        provider.dispose();
+      }
+    }, () => {
+      if (retryStarted) checkedDuringRetry();
+      return [{ model: contextModel.model, context_length: loadedContext }];
+    });
+  } finally {
+    vscode.window.showWarningMessage = originalWarning;
+  }
 });
 
-test('automatically retries with increased num_ctx when Ollama returns context exceeded error', async () => {
-  const requests = [];
-  let attempts = 0;
-  await withServer(async (request, response) => {
-    let body = '';
-    for await (const chunk of request) {
-      body += chunk;
-    }
-    attempts++;
-    requests.push(JSON.parse(body));
-    if (attempts === 1) {
-      response.writeHead(400, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({
-        error: 'request (12000 tokens) exceeds the available context size (4096 tokens), try increasing it'
-      }));
+test('reuses successful context sizes until another error or refresh without leaking across configurations', async () => {
+  await withContextServer((response, body, attempt) => {
+    if (attempt === 1 || attempt === 5) {
+      response.writeHead(400);
+      response.end(JSON.stringify({ error: attempt === 1
+        ? 'request (12000 tokens) exceeds the available context size (4096 tokens)'
+        : 'request (20000 tokens) exceeds the available context size (16384 tokens)' }));
       return;
     }
-    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
-    response.end(JSON.stringify({ message: { content: 'Recovered after retry' }, done: true }) + '\n');
-  }, async url => {
+    response.end(JSON.stringify({ message: { content: 'Hello' }, done: true }) + '\n');
+  }, async (url, requests) => {
     const provider = new OllamaLanguageModelProvider();
-    const model = {
-      id: 'qwen2.5:32b',
-      name: 'qwen2.5:32b',
-      model: 'qwen2.5:32b',
-      url,
-      headers: {},
-      local: false,
-      maxInputTokens: 28672,
-      maxOutputTokens: 4096
-    };
-    const messages = [{
-      role: vscode.LanguageModelChatMessageRole.User,
-      content: [new LanguageModelTextPart('Large prompt')]
-    }];
-    const progress = collectProgress();
+    const model = { ...contextModel, url };
     const token = cancellationTokenSource().token;
     try {
-      await provider.provideLanguageModelChatResponse(model, messages, {}, progress, token);
-      assert.equal(attempts, 2);
-      assert.equal(requests[0].options?.num_ctx, undefined);
-      // Retry allocated: 12000 + 4096 = 16096 -> rounded up to 16384 (16 * 1024)
-      assert.equal(requests[1].options?.num_ctx, 16384);
-      assert.equal(progress.reports[0].value, 'Recovered after retry');
+      for (const messages of [contextMessages, [], contextMessages, contextMessages, []]) {
+        await provider.provideLanguageModelChatResponse(model, messages, {}, collectProgress(), token);
+      }
+      assert.deepEqual(requests.map(request => request.options?.num_ctx), [undefined, 16384, 16384, 16384, 16384, 24576, 24576]);
+      for (const changed of [
+        { model: 'another-model' }, { headers: { Authorization: 'test-credential' } },
+        { maxInputTokens: 12288 }, { local: false }
+      ]) {
+        await provider.provideLanguageModelChatResponse({ ...model, ...changed }, [], {}, collectProgress(), token);
+        assert.equal(requests.at(-1).options?.num_ctx, undefined);
+      }
+      await provider.provideLanguageModelChatResponse(model, [], { modelOptions: { num_ctx: 8192 } }, collectProgress(), token);
+      assert.equal(requests.at(-1).options.num_ctx, 8192);
+      await withContextServer(response => {
+        response.end(JSON.stringify({ done: true }) + '\n');
+      }, async (otherURL, otherRequests) => {
+        await provider.provideLanguageModelChatResponse({ ...model, url: otherURL }, [], {}, collectProgress(), token);
+        assert.equal(otherRequests[0].options?.num_ctx, undefined);
+      });
+      provider.refresh();
+      await provider.provideLanguageModelChatResponse(model, [], {}, collectProgress(), token);
+      assert.equal(requests.at(-1).options?.num_ctx, undefined);
     } finally {
       provider.dispose();
     }
   });
 });
 
-test('formats actionable error when prompt exceeds model maximum context window', async () => {
-  await withServer(async (request, response) => {
-    request.resume();
-    response.writeHead(400, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-      error: 'request (35000 tokens) exceeds the available context size (4096 tokens), try increasing it'
-    }));
-  }, async url => {
+for (const { name, local = true, num_ctx, requested = 12000 } of [
+  { name: 'an explicit limit', num_ctx: 4096 },
+  { name: 'an explicit automatic value', num_ctx: 0 },
+  { name: 'an explicit sentinel value', num_ctx: -1 },
+  { name: 'a cloud model', local: false },
+  { name: 'a prompt beyond the model maximum', requested: 35000 }
+]) {
+  test(`does not retry a context error for ${name}`, async () => {
+    await withContextServer(response => {
+      response.writeHead(400);
+      response.end(JSON.stringify({ error: `request (${requested} tokens) exceeds the available context size (4096 tokens)` }));
+    }, async (url, requests) => {
+      const provider = new OllamaLanguageModelProvider();
+      try {
+        await assert.rejects(provider.provideLanguageModelChatResponse(
+          { ...contextModel, url, local }, contextMessages, { modelOptions: { num_ctx } },
+          collectProgress(), cancellationTokenSource().token
+        ), requested > 32768 ? /maximum context window \(32K\)/ : /allocated context window \(4K\)/);
+        assert.equal(requests.length, 1);
+        assert.equal(requests[0].options.num_ctx, num_ctx);
+      } finally {
+        provider.dispose();
+      }
+    });
+  });
+}
+
+test('stops after one failed retry without caching its context or claiming the model maximum was exceeded', async () => {
+  await withContextServer((response, body, attempt) => {
+    if (attempt <= 2) {
+      response.writeHead(400);
+      response.end(JSON.stringify({ error: 'request (12000 tokens) exceeds the available context size (4096 tokens)' }));
+      return;
+    }
+    response.end(JSON.stringify({ done: true }) + '\n');
+  }, async (url, requests) => {
     const provider = new OllamaLanguageModelProvider();
-    const model = {
-      id: 'qwen2.5:32b',
-      name: 'qwen2.5:32b',
-      model: 'qwen2.5:32b',
-      url,
-      headers: {},
-      local: false,
-      maxInputTokens: 28672,
-      maxOutputTokens: 4096
-    };
-    const messages = [{
-      role: vscode.LanguageModelChatMessageRole.User,
-      content: [new LanguageModelTextPart('Huge prompt')]
-    }];
-    const progress = collectProgress();
+    const model = { ...contextModel, url };
     const token = cancellationTokenSource().token;
     try {
-      await assert.rejects(
-        provider.provideLanguageModelChatResponse(model, messages, {}, progress, token),
-        error => error.message.includes("Prompt (35,000 tokens) exceeds qwen2.5:32b's maximum context window (32K)")
-      );
+      await assert.rejects(provider.provideLanguageModelChatResponse(model, [], {}, collectProgress(), token), /allocated context window \(4K\)/);
+      assert.equal(requests.length, 2);
+      await provider.provideLanguageModelChatResponse(model, [], {}, collectProgress(), token);
+      assert.equal(requests[2].options?.num_ctx, undefined);
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+test('cancels a context retry without caching it and allows the next request', { timeout: 5000 }, async () => {
+  let started;
+  const retryStarted = new Promise(resolve => { started = resolve; });
+  let closed;
+  const retryClosed = new Promise(resolve => { closed = resolve; });
+  await withContextServer((response, body, attempt) => {
+    if (attempt === 1) {
+      response.writeHead(400);
+      response.end(JSON.stringify({ error: 'request (12000 tokens) exceeds the available context size (4096 tokens)' }));
+    } else if (attempt === 2) {
+      response.on('close', closed);
+      started();
+    } else {
+      response.end(JSON.stringify({ done: true }) + '\n');
+    }
+  }, async (url, requests) => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { ...contextModel, url };
+    const source = cancellationTokenSource();
+    try {
+      const rejected = assert.rejects(provider.provideLanguageModelChatResponse(model, [], {}, collectProgress(), source.token), /abort|cancel/i);
+      await retryStarted;
+      source.cancel();
+      await rejected;
+      await retryClosed;
+      await provider.provideLanguageModelChatResponse(model, [], {}, collectProgress(), cancellationTokenSource().token);
+      assert.deepEqual(requests.map(request => request.options?.num_ctx), [undefined, 16384, undefined]);
+    } finally {
+      source.dispose();
+      provider.dispose();
+    }
+  });
+});
+
+test('does not replay tool calls after a streamed context error', async () => {
+  await withContextServer(response => {
+    response.write(JSON.stringify({ message: { tool_calls: [{ id: 'call-1', function: { name: 'lookup', arguments: {} } }] } }) + '\n');
+    response.end(JSON.stringify({ error: 'request (12000 tokens) exceeds the available context size (4096 tokens)' }) + '\n');
+  }, async (url, requests) => {
+    const provider = new OllamaLanguageModelProvider();
+    const progress = collectProgress();
+    try {
+      await assert.rejects(provider.provideLanguageModelChatResponse(
+        { ...contextModel, url }, [], {}, progress, cancellationTokenSource().token
+      ), /allocated context window/);
+      assert.equal(requests.length, 1);
+      assert.deepEqual(progress.reports, [new LanguageModelToolCallPart('call-1', 'lookup', {})]);
     } finally {
       provider.dispose();
     }
@@ -702,6 +805,23 @@ function cancellationTokenSource() {
       }
     }
   };
+}
+
+async function withContextServer(handleChat, run, listModels = () => []) {
+  const requests = [];
+  await withServer(async (request, response) => {
+    if (request.url === '/api/ps') {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ models: await listModels() }));
+      return;
+    }
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    const chat = JSON.parse(body);
+    requests.push(chat);
+    response.setHeader('content-type', 'application/x-ndjson');
+    await handleChat(response, chat, requests.length);
+  }, url => run(url, requests));
 }
 
 async function withServer(handler, run) {

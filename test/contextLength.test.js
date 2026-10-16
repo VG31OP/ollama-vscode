@@ -1,14 +1,12 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
-  defaultOllamaContextLength,
   formatContextLength,
   formatContextExceededError,
   isMachineContextTooSmall,
   machineContextLength,
   minimumMachineContextLength,
   parseContextExceededError,
-  resolveDynamicContextLength,
   waitForMachineContextCheckBeforeStreaming,
   waitForMachineContextLength
 } = require('../out/contextLength');
@@ -201,35 +199,6 @@ test('does not time out a machine context check that finishes first', async () =
   assert.equal(cancelled, false);
 });
 
-test('resolveDynamicContextLength leaves num_ctx undefined when request fits default Ollama context', () => {
-  assert.equal(defaultOllamaContextLength, 4096);
-  // 100 estimated prompt + 2048 max output = 2148 <= 4096
-  assert.equal(resolveDynamicContextLength(100, 32768, 2048), undefined);
-  // Exactly 4096
-  assert.equal(resolveDynamicContextLength(2048, 32768, 2048), undefined);
-});
-
-test('resolveDynamicContextLength calculates rounded num_ctx when request exceeds default context', () => {
-  // 5000 prompt + 2048 output = 7048 -> rounded to 7168 (7 * 1024)
-  assert.equal(resolveDynamicContextLength(5000, 32768, 2048), 7168);
-  // 10000 prompt + 4096 output = 14096 -> rounded to 14336 (14 * 1024)
-  assert.equal(resolveDynamicContextLength(10000, 32768, 4096), 14336);
-});
-
-test('resolveDynamicContextLength caps at model maximum context window', () => {
-  // 40000 prompt + 4096 output = 44096 > 32768 max context window
-  assert.equal(resolveDynamicContextLength(40000, 32768, 4096), 32768);
-});
-
-test('resolveDynamicContextLength respects valid user-configured num_ctx', () => {
-  assert.equal(resolveDynamicContextLength(100, 32768, 2048, 8192), 8192);
-  assert.equal(resolveDynamicContextLength(10000, 32768, 4096, 16384), 16384);
-  // Ignores invalid configurations
-  assert.equal(resolveDynamicContextLength(100, 32768, 2048, -1), undefined);
-  assert.equal(resolveDynamicContextLength(100, 32768, 2048, '8192'), undefined);
-  assert.equal(resolveDynamicContextLength(100, 32768, 2048, null), undefined);
-});
-
 test('parseContextExceededError extracts requested and available tokens from error message', () => {
   const errorMsg = 'request (32644 tokens) exceeds the available context size (4096 tokens), try increasing it';
   assert.deepEqual(parseContextExceededError(errorMsg), {
@@ -255,11 +224,22 @@ test('parseContextExceededError extracts requested and available tokens from err
   assert.equal(parseContextExceededError(undefined), undefined);
 });
 
-test('formatContextExceededError formats clear human-actionable message', () => {
-  const message = formatContextExceededError(32644, 32768, 'qwen2.5-coder:32b');
-  assert.equal(
-    message,
-    "Prompt (32,644 tokens) exceeds qwen2.5-coder:32b's maximum context window (32K). Shorten the prompt or remove attachments to continue."
-  );
+test('does not parse invalid or non-exceeding context counts', () => {
+  for (const [requested, available] of [[0, 4096], [12000, 0], [4096, 4096], [4000, 4096], [1e20, 4096]]) {
+    assert.equal(parseContextExceededError(
+      `request (${requested} tokens) exceeds the available context size (${available} tokens)`
+    ), undefined);
+  }
 });
 
+test('distinguishes an allocation error from the model maximum', () => {
+  const exceeded = { requestedTokens: 32644, availableTokens: 4096 };
+  assert.equal(
+    formatContextExceededError(exceeded, 32768, 'qwen2.5-coder:32b'),
+    'Prompt (32,644 tokens) exceeds the allocated context window (4K) for qwen2.5-coder:32b. Increase the context window or shorten the prompt to continue.'
+  );
+  assert.equal(
+    formatContextExceededError({ ...exceeded, requestedTokens: 35000 }, 32768, 'qwen2.5-coder:32b'),
+    "Prompt (35,000 tokens) exceeds qwen2.5-coder:32b's maximum context window (32K). Shorten the prompt or remove attachments to continue."
+  );
+});

@@ -352,6 +352,133 @@ test('preserves and surfaces an unsupported tool schema without retrying', async
   });
 });
 
+test('dynamically allocates num_ctx for requests exceeding default context', async () => {
+  let chatBody;
+  await withServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) {
+      body += chunk;
+    }
+    chatBody = JSON.parse(body);
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.end(JSON.stringify({ message: { content: 'Dynamic context response' }, done: true }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = {
+      id: 'qwen2.5:32b',
+      name: 'qwen2.5:32b',
+      model: 'qwen2.5:32b',
+      url,
+      headers: {},
+      local: false,
+      maxInputTokens: 28672,
+      maxOutputTokens: 4096
+    };
+    // 20000 characters ≈ 5000 tokens (with default 4 chars/token)
+    // 5000 prompt + 4096 output = 9096 -> rounds up to 10240 (10 * 1024)
+    const text = 'a'.repeat(20000);
+    const messages = [{
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [new LanguageModelTextPart(text)]
+    }];
+    const progress = collectProgress();
+    const token = cancellationTokenSource().token;
+    try {
+      await provider.provideLanguageModelChatResponse(model, messages, {}, progress, token);
+      assert.equal(chatBody.options?.num_ctx, 9216);
+      assert.equal(progress.reports[0].value, 'Dynamic context response');
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+test('automatically retries with increased num_ctx when Ollama returns context exceeded error', async () => {
+  const requests = [];
+  let attempts = 0;
+  await withServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) {
+      body += chunk;
+    }
+    attempts++;
+    requests.push(JSON.parse(body));
+    if (attempts === 1) {
+      response.writeHead(400, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        error: 'request (12000 tokens) exceeds the available context size (4096 tokens), try increasing it'
+      }));
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.end(JSON.stringify({ message: { content: 'Recovered after retry' }, done: true }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = {
+      id: 'qwen2.5:32b',
+      name: 'qwen2.5:32b',
+      model: 'qwen2.5:32b',
+      url,
+      headers: {},
+      local: false,
+      maxInputTokens: 28672,
+      maxOutputTokens: 4096
+    };
+    const messages = [{
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [new LanguageModelTextPart('Large prompt')]
+    }];
+    const progress = collectProgress();
+    const token = cancellationTokenSource().token;
+    try {
+      await provider.provideLanguageModelChatResponse(model, messages, {}, progress, token);
+      assert.equal(attempts, 2);
+      assert.equal(requests[0].options?.num_ctx, undefined);
+      // Retry allocated: 12000 + 4096 = 16096 -> rounded up to 16384 (16 * 1024)
+      assert.equal(requests[1].options?.num_ctx, 16384);
+      assert.equal(progress.reports[0].value, 'Recovered after retry');
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+test('formats actionable error when prompt exceeds model maximum context window', async () => {
+  await withServer(async (request, response) => {
+    request.resume();
+    response.writeHead(400, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      error: 'request (35000 tokens) exceeds the available context size (4096 tokens), try increasing it'
+    }));
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = {
+      id: 'qwen2.5:32b',
+      name: 'qwen2.5:32b',
+      model: 'qwen2.5:32b',
+      url,
+      headers: {},
+      local: false,
+      maxInputTokens: 28672,
+      maxOutputTokens: 4096
+    };
+    const messages = [{
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [new LanguageModelTextPart('Huge prompt')]
+    }];
+    const progress = collectProgress();
+    const token = cancellationTokenSource().token;
+    try {
+      await assert.rejects(
+        provider.provideLanguageModelChatResponse(model, messages, {}, progress, token),
+        error => error.message.includes("Prompt (35,000 tokens) exceeds qwen2.5:32b's maximum context window (32K)")
+      );
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
 test('uses the server model identifier for metadata and chat while preserving the display name', async () => {
   const tags = [{ name: 'qwen3.8:27b', model: '5090.qwen3.8:27b' }];
   await withModelServer(tags, ['5090.qwen3.8:27b'], async (url, requests) => {

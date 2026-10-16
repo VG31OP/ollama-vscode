@@ -23,9 +23,13 @@ import {
 } from './recommendations';
 import { createChatFetch } from './chatFetch';
 import {
+  defaultOllamaContextLength,
   formatContextLength,
+  formatContextExceededError,
   isMachineContextTooSmall,
   minimumMachineContextLength,
+  parseContextExceededError,
+  resolveDynamicContextLength,
   waitForMachineContextCheckBeforeStreaming,
   waitForMachineContextLength
 } from './contextLength';
@@ -271,6 +275,25 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         : undefined;
       const thinkingLevel = supportedThinkingLevel(model.thinkingPolicy, rawThinkingLevel);
 
+      let estimatedPromptTokens = 0;
+      for (const message of messages) {
+        estimatedPromptTokens += this.tokenCounts.count(model.id, message);
+      }
+
+      const totalContextWindow = (model.maxInputTokens ?? fallbackContextWindow)
+        + (model.maxOutputTokens ?? defaultMaxOutputTokens);
+      const configuredModelOptions = options.modelOptions ? { ...options.modelOptions } : undefined;
+      const dynamicNumCtx = resolveDynamicContextLength(
+        estimatedPromptTokens,
+        totalContextWindow,
+        model.maxOutputTokens ?? defaultMaxOutputTokens,
+        configuredModelOptions?.num_ctx
+      );
+
+      const requestOptions = dynamicNumCtx !== undefined
+        ? { ...(configuredModelOptions ?? {}), num_ctx: dynamicNumCtx }
+        : configuredModelOptions;
+
       let chatRequestSettled = false;
       const streamRequest = ollama.chat({
         model: model.model,
@@ -278,7 +301,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         stream: true,
         tools: tools.length > 0 ? tools : undefined,
         think: thinkingLevel,
-        options: options.modelOptions ? { ...options.modelOptions } : undefined
+        options: requestOptions
       } as ChatRequest & { stream: true });
       void streamRequest.then(
         () => { chatRequestSettled = true; },
@@ -305,7 +328,39 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         );
       }
 
-      const stream = await streamRequest;
+      let stream;
+      try {
+        stream = await streamRequest;
+      } catch (streamError) {
+        const exceeded = parseContextExceededError(formatError(streamError));
+        const currentNumCtx = (typeof requestOptions?.num_ctx === 'number' ? requestOptions.num_ctx : undefined)
+          ?? exceeded?.availableTokens
+          ?? defaultOllamaContextLength;
+        if (exceeded && exceeded.requestedTokens <= totalContextWindow && currentNumCtx < totalContextWindow) {
+          const retryNumCtx = Math.min(
+            totalContextWindow,
+            Math.ceil((exceeded.requestedTokens + (model.maxOutputTokens ?? defaultMaxOutputTokens)) / 1024) * 1024
+          );
+          if (retryNumCtx > currentNumCtx) {
+            this.output?.appendLine(
+              `Prompt (${exceeded.requestedTokens} tokens) exceeded Ollama context (${exceeded.availableTokens}). Retrying ${model.model} with num_ctx=${retryNumCtx}...`
+            );
+            const retryStreamRequest = ollama.chat({
+              model: model.model,
+              messages: ollamaMessages,
+              stream: true,
+              tools: tools.length > 0 ? tools : undefined,
+              think: thinkingLevel,
+              options: { ...(requestOptions ?? {}), num_ctx: retryNumCtx }
+            } as ChatRequest & { stream: true });
+            stream = await retryStreamRequest;
+          } else {
+            throw streamError;
+          }
+        } else {
+          throw streamError;
+        }
+      }
       const streamDisposable = token.onCancellationRequested(() => stream.abort());
       disposables.push(streamDisposable);
       if (contextLengthCheck && machineContextSource) {
@@ -396,6 +451,14 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         void vscode.window.showErrorMessage(message);
       }
 
+      return new Error(message);
+    }
+
+    const exceeded = parseContextExceededError(error);
+    if (exceeded) {
+      const totalContextWindow = (model.maxInputTokens ?? fallbackContextWindow)
+        + (model.maxOutputTokens ?? defaultMaxOutputTokens);
+      const message = formatContextExceededError(exceeded.requestedTokens, totalContextWindow, model.name);
       return new Error(message);
     }
 

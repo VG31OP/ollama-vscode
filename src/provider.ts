@@ -24,8 +24,10 @@ import {
 import { createChatFetch } from './chatFetch';
 import {
   formatContextLength,
+  formatContextExceededError,
   isMachineContextTooSmall,
   minimumMachineContextLength,
+  parseContextExceededError,
   waitForMachineContextCheckBeforeStreaming,
   waitForMachineContextLength
 } from './contextLength';
@@ -152,6 +154,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   private readonly outdatedModelWarnings = new OutdatedModelWarningTracker();
   private readonly machineContextWarnings = new Set<string>();
   private readonly diagnosticsConfigurations = new OllamaDiagnosticsConfigurationTracker();
+  private recoveredContextLengths = new Map<string, number>();
   private readonly thinkingDiagnosticGroups = new Map<string, {
     url: string;
     models: ThinkingDiagnosticModel[];
@@ -161,12 +164,14 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   constructor(private readonly output?: vscode.OutputChannel) {}
 
   refresh() {
+    this.recoveredContextLengths = new Map();
     this.resetThinkingDiagnostics();
     this.output?.appendLine('Refreshing Ollama language models.');
     this.changeEmitter.fire();
   }
 
   dispose() {
+    this.recoveredContextLengths = new Map();
     this.resetThinkingDiagnostics();
     this.changeEmitter.dispose();
   }
@@ -300,15 +305,55 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         : undefined;
       const thinkingLevel = supportedThinkingLevel(model.thinkingPolicy, rawThinkingLevel);
 
+      const totalContextWindow = (model.maxInputTokens ?? fallbackContextWindow)
+        + (model.maxOutputTokens ?? defaultMaxOutputTokens);
+      const configuredModelOptions = options.modelOptions ? { ...options.modelOptions } : undefined;
+      const canRecoverContext = model.local && configuredModelOptions?.num_ctx === undefined;
+      // Keep successful allocations stable across turns, isolated by server and credentials.
+      // Refresh replaces the map so an in-flight request cannot repopulate the new cache.
+      const recoveredContextLengths = this.recoveredContextLengths;
+      const contextKey = createHash('sha256')
+        .update(JSON.stringify([model.url, model.model, model.headers, totalContextWindow]))
+        .digest('hex');
+      const recoveredNumCtx = canRecoverContext ? recoveredContextLengths.get(contextKey) : undefined;
+      const requestOptions = recoveredNumCtx !== undefined
+        ? { ...configuredModelOptions, num_ctx: recoveredNumCtx }
+        : configuredModelOptions;
+
       let chatRequestSettled = false;
-      const streamRequest = ollama.chat({
+      let retryNumCtx: number | undefined;
+      const request = {
         model: model.model,
         messages: ollamaMessages,
         stream: true,
         tools: tools.length > 0 ? tools : undefined,
         think: thinkingLevel,
-        options: options.modelOptions ? { ...options.modelOptions } : undefined
-      } as ChatRequest & { stream: true });
+        options: requestOptions
+      } as ChatRequest & { stream: true };
+      const streamRequest = (async () => {
+        try {
+          return await ollama.chat(request);
+        } catch (error) {
+          const exceeded = parseContextExceededError(error);
+          if (!canRecoverContext || token.isCancellationRequested || !exceeded
+            || exceeded.requestedTokens > totalContextWindow) {
+            throw error;
+          }
+          const target = Math.min(
+            totalContextWindow,
+            Math.ceil((exceeded.requestedTokens + (model.maxOutputTokens ?? defaultMaxOutputTokens)) / 1024) * 1024
+          );
+          if (target <= Math.max(recoveredNumCtx ?? 0, exceeded.availableTokens)) {
+            throw error;
+          }
+          retryNumCtx = target;
+          this.output?.appendLine(
+            `Prompt (${exceeded.requestedTokens} tokens) exceeded Ollama context (${exceeded.availableTokens}). Retrying ${model.model} with num_ctx=${retryNumCtx}...`
+          );
+          // Retry only before receiving a stream, never replay partially emitted tool calls.
+          return ollama.chat({ ...request, options: { ...requestOptions, num_ctx: retryNumCtx } });
+        }
+      })();
       void streamRequest.then(
         () => { chatRequestSettled = true; },
         () => { chatRequestSettled = true; }
@@ -389,6 +434,12 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       if (promptTokenCount !== undefined && tools.length === 0) {
         this.tokenCounts.record(model.id, messages, promptTokenCount);
       }
+      if (retryNumCtx !== undefined && !token.isCancellationRequested) {
+        recoveredContextLengths.set(contextKey, Math.max(retryNumCtx, recoveredContextLengths.get(contextKey) ?? 0));
+        if (recoveredContextLengths.size > 100) {
+          recoveredContextLengths.delete(recoveredContextLengths.keys().next().value!);
+        }
+      }
       requestSucceeded = true;
     } catch (error) {
       throw await this.handleChatError(model, error);
@@ -425,6 +476,14 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         void vscode.window.showErrorMessage(message);
       }
 
+      return new Error(message);
+    }
+
+    const exceeded = parseContextExceededError(error);
+    if (exceeded) {
+      const totalContextWindow = (model.maxInputTokens ?? fallbackContextWindow)
+        + (model.maxOutputTokens ?? defaultMaxOutputTokens);
+      const message = formatContextExceededError(exceeded, totalContextWindow, model.name);
       return new Error(message);
     }
 

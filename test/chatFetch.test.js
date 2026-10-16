@@ -182,23 +182,39 @@ test('enforces a finite response header timeout', async () => {
   });
 });
 
-test('disables body timeout by default to allow long streaming responses', async () => {
+test('keeps a stream open after more than five minutes without data', { timeout: 5000 }, async () => {
+  const timers = require('undici/lib/util/timers');
+  let serverResponse;
   await withServer((request, response) => {
     request.resume();
+    serverResponse = response;
     response.writeHead(200, { 'Content-Type': 'text/plain' });
     response.write('part1');
-    setTimeout(() => {
-      response.write('part2');
-      response.end();
-    }, 150);
   }, async url => {
     const transport = createChatFetch(1000);
     try {
       const response = await transport.fetch(`${url}/api/chat`);
-      assert.strictEqual(response.status, 200);
-      assert.strictEqual(await response.text(), 'part1part2');
+      assert.equal(response.status, 200);
+      const reader = response.body.getReader();
+      const first = await withTimeout(reader.read(), 1000);
+      assert.equal(new TextDecoder().decode(first.value), 'part1');
+
+      // Advance Undici's test clock beyond its old 300,000 ms idle timeout.
+      // Keep a read pending so backpressure cannot suspend that timeout.
+      const nextChunk = reader.read().then(result => ({ result }), error => ({ error }));
+      timers.tick(1000);
+      timers.tick(301000);
+      await new Promise(resolve => setImmediate(resolve));
+      serverResponse.end('part2');
+
+      const next = await withTimeout(nextChunk, 1000);
+      assert.ifError(next.error);
+      assert.equal(next.result.done, false);
+      assert.equal(new TextDecoder().decode(next.result.value), 'part2');
+      assert.equal((await withTimeout(reader.read(), 1000)).done, true);
     } finally {
       transport.dispose();
+      timers.reset();
     }
   });
 });

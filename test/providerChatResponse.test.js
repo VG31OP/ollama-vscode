@@ -279,6 +279,38 @@ test('rejects when the stream ends without any completion signal', async () => {
   });
 });
 
+test('includes a stream failure cause in the chat error and diagnostics', { timeout: 5000 }, async () => {
+  let serverResponse;
+  await withServer((request, response) => {
+    request.resume();
+    serverResponse = response;
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.write(`${JSON.stringify({ message: { content: 'partial' } })}\n`);
+  }, async url => {
+    const logs = [];
+    const provider = new OllamaLanguageModelProvider({ appendLine: line => logs.push(line) });
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    const source = cancellationTokenSource();
+    const reports = [];
+    try {
+      await assert.rejects(provider.provideLanguageModelChatResponse(model, [], {}, {
+        report(part) {
+          reports.push(part);
+          serverResponse.destroy();
+        }
+      }, source.token), { message: 'terminated: other side closed' });
+      assert.deepEqual(reports, [new LanguageModelTextPart('partial')]);
+      assert.deepEqual(logs, [
+        `Sending chat request to test-model at ${url}.`,
+        'Ollama request failed for test-model: terminated: other side closed'
+      ]);
+    } finally {
+      source.dispose();
+      provider.dispose();
+    }
+  });
+});
+
 test('still rejects an unrelated stream error received after a done_reason chunk', async () => {
   await withServer((request, response) => {
     request.resume();

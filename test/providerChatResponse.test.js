@@ -39,7 +39,15 @@ class EventEmitter {
   dispose() {}
 }
 
+class CancellationError extends Error {
+  constructor(message = 'Canceled') {
+    super(message);
+    this.name = 'CancellationError';
+  }
+}
+
 const vscode = {
+  CancellationError,
   LanguageModelChatMessageRole: { User: 1, Assistant: 2, System: 3 },
   LanguageModelTextPart,
   LanguageModelDataPart,
@@ -721,6 +729,143 @@ test('distinguishes matching display names and prefers an exact configured ident
     assert.equal(selected.name, 'qwen3.8:27b');
     assert.equal(selected.id, '5090.qwen3.8:27b');
     await runChatResponse(url, collectProgress(), {}, selected);
+  });
+});
+
+test('retries a chat request rejected for an unparseable tool call and succeeds', { timeout: 5000 }, async () => {
+  let attempts = 0;
+  const requests = [];
+  await withServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) {
+      body += chunk;
+    }
+    requests.push(JSON.parse(body));
+    attempts++;
+    if (attempts === 1) {
+      response.writeHead(500, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        error: 'error parsing tool call: raw=\'{"name":"calc","args":{]"}\', err=invalid character \']\''
+      }));
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.end(JSON.stringify({ message: { content: 'Recovered answer' }, done: true }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    const progress = collectProgress();
+    try {
+      await provider.provideLanguageModelChatResponse(
+        model,
+        [{ role: vscode.LanguageModelChatMessageRole.User, content: [new LanguageModelTextPart('Hello')] }],
+        {},
+        progress,
+        cancellationTokenSource().token
+      );
+      assert.equal(attempts, 2);
+      assert.equal(requests.length, 2);
+      assert.equal(progress.reports[0].value, 'Recovered answer');
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+test('fails with an actionable message when unparseable tool call retries are exhausted', { timeout: 5000 }, async () => {
+  let attempts = 0;
+  await withServer(async (request, response) => {
+    request.resume();
+    attempts++;
+    response.writeHead(500, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      error: 'error parsing tool call: raw=\'{"name":"calc","args":{]"}\', err=invalid character \']\''
+    }));
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    try {
+      await assert.rejects(
+        provider.provideLanguageModelChatResponse(
+          model,
+          [{ role: vscode.LanguageModelChatMessageRole.User, content: [new LanguageModelTextPart('Hello')] }],
+          {},
+          collectProgress(),
+          cancellationTokenSource().token
+        ),
+        /test-model produced a tool call that could not be parsed, and retrying did not help/
+      );
+      assert.equal(attempts, 3);
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
+test('aborts stream immediately when cancellation occurs while stream is in flight', { timeout: 5000 }, async () => {
+  let closed;
+  const connectionClosed = new Promise(resolve => { closed = resolve; });
+  let chatStarted;
+  const chatReceived = new Promise(resolve => { chatStarted = resolve; });
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.on('close', closed);
+    chatStarted();
+    response.write(JSON.stringify({ message: { content: 'chunk' } }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    const source = cancellationTokenSource();
+    try {
+      const responsePromise = provider.provideLanguageModelChatResponse(
+        model,
+        [],
+        {},
+        collectProgress(),
+        source.token
+      );
+      await chatReceived;
+      source.cancel();
+      await assert.rejects(responsePromise, /abort|cancel/i);
+      await connectionClosed;
+    } finally {
+      source.dispose();
+      provider.dispose();
+    }
+  });
+});
+
+test('aborts active stream in finally when an error occurs during streaming', { timeout: 5000 }, async () => {
+  let closed;
+  const connectionClosed = new Promise(resolve => { closed = resolve; });
+  await withServer((request, response) => {
+    request.resume();
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.on('close', closed);
+    response.write(JSON.stringify({ message: { content: 'first' } }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    try {
+      await assert.rejects(
+        provider.provideLanguageModelChatResponse(
+          model,
+          [],
+          {},
+          {
+            report() {
+              throw new Error('consumer error');
+            }
+          },
+          cancellationTokenSource().token
+        ),
+        /consumer error/
+      );
+      await connectionClosed;
+    } finally {
+      provider.dispose();
+    }
   });
 });
 

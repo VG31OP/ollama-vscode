@@ -2,76 +2,20 @@ const assert = require('node:assert/strict');
 const Module = require('node:module');
 const test = require('node:test');
 
-class CancellationError extends Error {
-  constructor(message = 'Canceled') {
-    super(message);
-    this.name = 'CancellationError';
-  }
-}
-
-const vscode = {
-  CancellationError,
-  EventEmitter: class { constructor() { this.event = () => ({ dispose() {} }); } fire() {} dispose() {} },
-  CancellationTokenSource: class { constructor() { this.token = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }; } cancel() {} dispose() {} },
-  LanguageModelChatMessageRole: { User: 1, Assistant: 2 },
-  LanguageModelTextPart: class {},
-  LanguageModelDataPart: class {},
-  LanguageModelToolCallPart: class {},
-  LanguageModelToolResultPart: class {},
-  lm: { registerLanguageModelChatProvider: () => ({ dispose() {} }) },
-  window: { showErrorMessage: () => undefined, createOutputChannel: () => ({ appendLine() {}, dispose() {} }) },
-  workspace: { getConfiguration: () => ({ get: () => undefined }), onDidChangeConfiguration: () => ({ dispose() {} }) },
-  Uri: { parse: (v) => v },
-  env: { openExternal: () => undefined }
-};
-
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
   if (request === 'vscode') {
-    return vscode;
+    return {};
   }
   return originalLoad.call(this, request, parent, isMain);
 };
 
 let isAbortedRequestError;
-let isToolCallParseError;
-let OllamaAPIError;
 try {
-  ({ isAbortedRequestError, isToolCallParseError, OllamaAPIError } = require('../out/provider'));
+  ({ isAbortedRequestError } = require('../out/provider'));
 } finally {
   Module._load = originalLoad;
 }
-
-function apiError(status, responseError) {
-  return new OllamaAPIError(
-    `Ollama /api/chat failed with HTTP ${status}: ${responseError}`,
-    status,
-    '/api/chat',
-    responseError
-  );
-}
-
-// The exact payload Ollama rejected: a stray quote after the empty array.
-const realParseError = `error parsing tool call: raw='{"command":"pytest -q","requestFileValidationCheck":[]","requestUnsandboxedExecution":false}', err=invalid character '"' after object key:value pair`;
-
-test('classifies Ollama tool-call parse rejection as retryable', () => {
-  assert.equal(isToolCallParseError(apiError(500, realParseError)), true);
-  assert.equal(isToolCallParseError({ status: 500, responseError: realParseError }), true);
-  assert.equal(isToolCallParseError({ status: 500, message: realParseError }), true);
-});
-
-test('does not retry other server errors', () => {
-  assert.equal(isToolCallParseError(apiError(500, 'model requires more system memory')), false);
-  assert.equal(isToolCallParseError(apiError(500, 'internal server error')), false);
-});
-
-test('does not retry client errors or non-API errors', () => {
-  assert.equal(isToolCallParseError(apiError(404, 'model not found')), false);
-  assert.equal(isToolCallParseError(apiError(400, 'bad request')), false);
-  assert.equal(isToolCallParseError(new TypeError('terminated')), false);
-  assert.equal(isToolCallParseError(undefined), false);
-  assert.equal(isToolCallParseError(null), false);
-});
 
 test('recognizes a DOM-style AbortError', () => {
   const error = new Error('This operation was aborted');

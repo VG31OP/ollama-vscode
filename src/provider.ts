@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { createHash, randomUUID } from 'crypto';
 import {
-  AbortableAsyncIterator,
+  type AbortableAsyncIterator,
   Ollama,
   ChatRequest,
   ChatResponse,
@@ -137,9 +137,7 @@ interface OllamaErrorResponse {
   signin_url?: string;
 }
 
-const maxToolCallParseRetries = 2;
-
-export class OllamaAPIError extends Error {
+class OllamaAPIError extends Error {
   constructor(
     message: string,
     readonly status: number,
@@ -148,7 +146,6 @@ export class OllamaAPIError extends Error {
     readonly signinURL?: string
   ) {
     super(message);
-    this.name = 'OllamaAPIError';
   }
 }
 
@@ -298,7 +295,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
     let requestSucceeded = false;
     let machineContextSource: vscode.CancellationTokenSource | undefined;
     let streamCompleted = false;
-    let stream: (AbortableAsyncIterator<ChatResponse> & AsyncIterable<ChatResponse>) | undefined;
+    let stream: AbortableAsyncIterator<ChatResponse> | undefined;
 
     try {
       let promptTokenCount: number | undefined;
@@ -327,8 +324,6 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
 
       let chatRequestSettled = false;
       let retryNumCtx: number | undefined;
-      let toolCallParseAttempt = 0;
-      let currentOptions = requestOptions;
       const request = {
         model: model.model,
         messages: ollamaMessages,
@@ -338,41 +333,27 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         options: requestOptions
       } as ChatRequest & { stream: true };
       const streamRequest = (async () => {
-        while (true) {
-          try {
-            return await ollama.chat({ ...request, options: currentOptions });
-          } catch (error) {
-            if (token.isCancellationRequested) {
-              throw error;
-            }
-
-            if (isToolCallParseError(error) && toolCallParseAttempt < maxToolCallParseRetries) {
-              toolCallParseAttempt++;
-              this.output?.appendLine(
-                `${model.model} returned an unparseable tool call; retrying (${toolCallParseAttempt} of ${maxToolCallParseRetries}).`
-              );
-              continue;
-            }
-
-            const exceeded = parseContextExceededError(error);
-            if (canRecoverContext && retryNumCtx === undefined && exceeded
-              && exceeded.requestedTokens <= totalContextWindow) {
-              const target = Math.min(
-                totalContextWindow,
-                Math.ceil((exceeded.requestedTokens + (model.maxOutputTokens ?? defaultMaxOutputTokens)) / 1024) * 1024
-              );
-              if (target > Math.max(recoveredNumCtx ?? 0, exceeded.availableTokens)) {
-                retryNumCtx = target;
-                currentOptions = { ...currentOptions, num_ctx: retryNumCtx };
-                this.output?.appendLine(
-                  `Prompt (${exceeded.requestedTokens} tokens) exceeded Ollama context (${exceeded.availableTokens}). Retrying ${model.model} with num_ctx=${retryNumCtx}...`
-                );
-                continue;
-              }
-            }
-
+        try {
+          return await ollama.chat(request);
+        } catch (error) {
+          const exceeded = parseContextExceededError(error);
+          if (!canRecoverContext || token.isCancellationRequested || !exceeded
+            || exceeded.requestedTokens > totalContextWindow) {
             throw error;
           }
+          const target = Math.min(
+            totalContextWindow,
+            Math.ceil((exceeded.requestedTokens + (model.maxOutputTokens ?? defaultMaxOutputTokens)) / 1024) * 1024
+          );
+          if (target <= Math.max(recoveredNumCtx ?? 0, exceeded.availableTokens)) {
+            throw error;
+          }
+          retryNumCtx = target;
+          this.output?.appendLine(
+            `Prompt (${exceeded.requestedTokens} tokens) exceeded Ollama context (${exceeded.availableTokens}). Retrying ${model.model} with num_ctx=${retryNumCtx}...`
+          );
+          // Retry only before receiving a stream, never replay partially emitted tool calls.
+          return ollama.chat({ ...request, options: { ...requestOptions, num_ctx: retryNumCtx } });
         }
       })();
       void streamRequest.then(
@@ -404,7 +385,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       const streamDisposable = token.onCancellationRequested(() => stream?.abort());
       disposables.push(streamDisposable);
       if (token.isCancellationRequested) {
-        stream.abort();
+        throw new vscode.CancellationError();
       }
       if (contextLengthCheck && machineContextSource) {
         const contextSource = machineContextSource;
@@ -419,6 +400,10 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
 
       try {
         for await (const chunk of stream as AsyncIterable<ChatResponse>) {
+          // Aborting the fetch does not discard messages already buffered by the SDK.
+          if (token.isCancellationRequested) {
+            throw new vscode.CancellationError();
+          }
           const response = chunk as OllamaChatResponse;
           if (response.done || response.status === 'success' || response.done_reason) {
             streamCompleted = true;
@@ -436,6 +421,9 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           }
 
           for (const toolCall of response.message?.tool_calls ?? []) {
+            if (token.isCancellationRequested) {
+              throw new vscode.CancellationError();
+            }
             progress.report(new vscode.LanguageModelToolCallPart(
               toolCall.id ?? randomUUID(),
               toolCall.function.name,
@@ -449,6 +437,9 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         if (!streamCompleted || !isMissingStreamCompletionError(streamError)) {
           throw streamError;
         }
+      }
+      if (token.isCancellationRequested) {
+        throw new vscode.CancellationError();
       }
       const usagePart = buildUsageDataPart(promptTokenCount, completionTokenCount);
       if (usagePart) {
@@ -472,7 +463,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
       }
       throw await this.handleChatError(model, error);
     } finally {
-      if (!streamCompleted) {
+      if (!requestSucceeded) {
         stream?.abort();
       }
       machineContextSource?.cancel();
@@ -516,12 +507,6 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         + (model.maxOutputTokens ?? defaultMaxOutputTokens);
       const message = formatContextExceededError(exceeded, totalContextWindow, model.name);
       return new Error(message);
-    }
-
-    if (isToolCallParseError(error)) {
-      return new Error(
-        `${model.model} produced a tool call that could not be parsed, and retrying did not help. Try again, or use a different model for tool-calling requests.`
-      );
     }
 
     return this.userFacingError(error);
@@ -1092,27 +1077,6 @@ function isAbortError(error: unknown): boolean {
     && error.name === 'AbortError';
 }
 
-export function isToolCallParseError(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) {
-    return false;
-  }
-  const isOllamaError = error instanceof OllamaAPIError
-    || ('status' in error && (error as { status: unknown }).status === 500);
-  if (!isOllamaError) {
-    return false;
-  }
-  const status = (error as { status?: unknown }).status;
-  if (status !== 500) {
-    return false;
-  }
-  const message = 'responseError' in error && typeof (error as { responseError?: unknown }).responseError === 'string'
-    ? (error as { responseError: string }).responseError
-    : ('message' in error && typeof (error as { message?: unknown }).message === 'string'
-      ? (error as { message: string }).message
-      : '');
-  return /parsing tool call/i.test(message);
-}
-
 export function isAbortedRequestError(error: unknown): boolean {
   let current: unknown = error;
   const visited = new Set<unknown>();
@@ -1123,9 +1087,6 @@ export function isAbortedRequestError(error: unknown): boolean {
       return true;
     }
     if (current instanceof TypeError && current.message === 'terminated') {
-      return true;
-    }
-    if (current instanceof Error && current.name === 'AbortError') {
       return true;
     }
     current = 'cause' in current ? (current as { cause: unknown }).cause : undefined;

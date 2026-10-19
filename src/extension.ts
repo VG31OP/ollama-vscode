@@ -31,6 +31,7 @@ async function diagnoseModels(output: vscode.OutputChannel, provider: OllamaLang
   output.show(true);
   output.appendLine('--- Diagnostics ---');
 
+  provider.resetThinkingDiagnostics();
   const allVSCodeModels = await vscode.lm.selectChatModels();
   output.appendLine(`VS Code returned ${allVSCodeModels.length} total language model(s).`);
   for (const model of allVSCodeModels) {
@@ -39,6 +40,11 @@ async function diagnoseModels(output: vscode.OutputChannel, provider: OllamaLang
 
   const ollamaVSCodeModels = allVSCodeModels.filter(model => model.vendor === ollamaVendor);
   output.appendLine(`VS Code returned ${ollamaVSCodeModels.length} Ollama language model(s).`);
+
+  const settings = vscode.workspace.getConfiguration('ollama');
+  for (const line of provider.getThinkingDiagnosticLines(settings.get<unknown>('thinkingLevels'))) {
+    output.appendLine(line);
+  }
 
   await inspectDirectOllamaModels(output, provider);
 

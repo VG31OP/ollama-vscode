@@ -446,6 +446,10 @@ for (const local of [true, false]) {
           );
         }
         assert.deepEqual(requests.map(request => request.options), [{ temperature: 0.2 }, { temperature: 0.2 }]);
+        for (const request of requests) {
+          assert.equal(request.truncate, local ? false : undefined);
+          assert.equal(Object.hasOwn(request, 'truncate'), local);
+        }
         assert.deepEqual(requests[0].messages, [
           { role: 'user', content: 'a'.repeat(20000), images: ['AQID'] },
           { role: 'assistant', content: '', tool_calls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'app.ts' } } }] },
@@ -503,6 +507,60 @@ test('retries the complete request and checks the context loaded by the retry', 
   } finally {
     vscode.window.showWarningMessage = originalWarning;
   }
+});
+
+test('recovers oversized tool history across retries and provider recreation without trimming it', async () => {
+  await withContextServer((response, body) => {
+    // Ollama 0.35.0's Qwen renderer rejects history after truncation removes
+    // its user query. Disabling truncation exposes the recoverable size error.
+    if (body.truncate !== false) {
+      response.writeHead(500);
+      response.end(JSON.stringify({ error: 'no user query found in messages' }));
+      return;
+    }
+    const allocated = body.options?.num_ctx ?? 4096;
+    if (allocated < 12000) {
+      response.writeHead(400);
+      response.end(JSON.stringify({ error: `request (12000 tokens) exceeds the available context size (${allocated} tokens)` }));
+      return;
+    }
+    response.end(JSON.stringify({ message: { content: 'Recovered' }, done: true }) + '\n');
+  }, async (url, requests) => {
+    let provider = new OllamaLanguageModelProvider();
+    const originalHistory = JSON.stringify(contextMessages);
+    const followup = { role: 1, content: [new LanguageModelTextPart('hi')] };
+    const send = async messages => {
+      const progress = collectProgress();
+      await provider.provideLanguageModelChatResponse(
+        { ...contextModel, url }, messages, {}, progress, cancellationTokenSource().token
+      );
+      assert.equal(progress.reports[0].value, 'Recovered');
+    };
+    try {
+      await send(contextMessages);
+      await send(contextMessages);
+      provider.dispose();
+      provider = new OllamaLanguageModelProvider();
+      await send(contextMessages);
+      await send([...contextMessages, followup]);
+
+      assert.deepEqual(requests.map(request => request.options?.num_ctx), [
+        undefined, 16384, 16384, undefined, 16384, 16384
+      ]);
+      const expectedHistory = [
+        { role: 'user', content: 'a'.repeat(20000), images: ['AQID'] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'app.ts' } } }] },
+        { role: 'tool', content: 'b'.repeat(48000), tool_call_id: 'read-1' }
+      ];
+      for (const request of requests.slice(0, -1)) {
+        assert.deepEqual(request.messages, expectedHistory);
+      }
+      assert.deepEqual(requests.at(-1).messages, [...expectedHistory, { role: 'user', content: 'hi' }]);
+      assert.equal(JSON.stringify(contextMessages), originalHistory);
+    } finally {
+      provider.dispose();
+    }
+  });
 });
 
 test('reuses successful context sizes until another error or refresh without leaking across configurations', async () => {

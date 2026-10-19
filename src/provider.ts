@@ -335,6 +335,9 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
         stream: true,
         tools: tools.length > 0 ? tools : undefined,
         think: thinkingLevel,
+        // Keep user queries and tool pairs intact; recover from a size error
+        // instead of letting the server truncate history before rendering it.
+        truncate: model.local ? false : undefined,
         options: requestOptions
       } as ChatRequest & { stream: true };
       const streamRequest = (async () => {

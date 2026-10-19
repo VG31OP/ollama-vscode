@@ -35,6 +35,7 @@ import {
   OllamaDiagnosticsConfigurationTracker,
   type OllamaDiagnosticsConfiguration,
   type OllamaDiagnosticsConfigurationSelection,
+  modelCapabilityDiagnosticLines,
   thinkingDiagnosticLines,
   type ThinkingDiagnosticModel
 } from './diagnostics';
@@ -155,9 +156,9 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   private readonly machineContextWarnings = new Set<string>();
   private readonly diagnosticsConfigurations = new OllamaDiagnosticsConfigurationTracker();
   private recoveredContextLengths = new Map<string, number>();
-  private readonly thinkingDiagnosticGroups = new Map<string, {
+  private readonly modelDiagnosticGroups = new Map<string, {
     url: string;
-    models: ThinkingDiagnosticModel[];
+    models: OllamaLanguageModel[];
   }>();
   readonly onDidChangeLanguageModelChatInformation = this.changeEmitter.event;
 
@@ -183,11 +184,20 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   }
 
   resetThinkingDiagnostics() {
-    this.thinkingDiagnosticGroups.clear();
+    this.modelDiagnosticGroups.clear();
+  }
+
+  getModelCapabilityDiagnosticLines(): string[] {
+    return [...this.modelDiagnosticGroups.values()].flatMap(group => {
+      const lines = modelCapabilityDiagnosticLines(group.models);
+      return lines.length > 0
+        ? [`Model capabilities for ${diagnosticEndpoint(group.url)}:`, ...lines.slice(1)]
+        : [];
+    });
   }
 
   getThinkingDiagnosticLines(configuredLevels?: unknown): string[] {
-    return [...this.thinkingDiagnosticGroups.values()].flatMap(group => {
+    return [...this.modelDiagnosticGroups.values()].flatMap(group => {
       const lines = thinkingDiagnosticLines(group.models, configuredLevels);
       return lines.length > 0
         ? [`Thinking settings for ${diagnosticEndpoint(group.url)}:`, ...lines.slice(1)]
@@ -201,7 +211,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
   ): Promise<OllamaLanguageModel[]> {
     const configuration = getConfiguration(options);
     const diagnosticsKey = JSON.stringify(configuration);
-    this.thinkingDiagnosticGroups.delete(diagnosticsKey);
+    this.modelDiagnosticGroups.delete(diagnosticsKey);
     this.diagnosticsConfigurations.recordResolved(configuration);
     const disposables: vscode.Disposable[] = [];
     const request = createFetch(token, disposables);
@@ -239,7 +249,7 @@ export class OllamaLanguageModelProvider implements vscode.LanguageModelChatProv
           recommendedReplacement(model.name, availableModels, recommendations),
           isRecommendedModel(model.name, recommendations)
         ));
-        this.thinkingDiagnosticGroups.set(diagnosticsKey, {
+        this.modelDiagnosticGroups.set(diagnosticsKey, {
           url: configuration.url,
           models: languageModels
         });

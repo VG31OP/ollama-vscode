@@ -80,6 +80,69 @@ try {
   Module._load = originalLoad;
 }
 
+test('counts adjacent text fragments while separating text data parts', async () => {
+  const provider = new OllamaLanguageModelProvider();
+  try {
+    const model = { id: 'test-model' };
+    const token = cancellationTokenSource().token;
+    const message = {
+      role: vscode.LanguageModelChatMessageRole.Assistant,
+      content: [new LanguageModelTextPart('abcd'), new LanguageModelTextPart('efgh')]
+    };
+    assert.equal(await provider.provideTokenCount(model, message, token), 2);
+    const mixed = {
+      ...message,
+      content: [
+        new LanguageModelTextPart('abcd'),
+        new LanguageModelDataPart(new TextEncoder().encode('efgh'), 'text/plain')
+      ]
+    };
+    assert.equal(await provider.provideTokenCount(model, mixed, token), 3);
+    assert.equal(await provider.provideTokenCount(model, structuredClone(message), token), 2);
+    assert.equal(await provider.provideTokenCount(model, structuredClone(mixed), token), 3);
+  } finally {
+    provider.dispose();
+  }
+});
+
+test('preserves streamed fragments in structural history and calibrates against the joined text', async () => {
+  const requests = [];
+  await withServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push(JSON.parse(body));
+    response.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    response.write(JSON.stringify({ message: { content: 'Hel' } }) + '\n');
+    response.end(JSON.stringify({ message: { content: 'lo' }, done: true, prompt_eval_count: 4 }) + '\n');
+  }, async url => {
+    const provider = new OllamaLanguageModelProvider();
+    const model = { id: 'test-model', name: 'test-model', model: 'test-model', url, headers: {}, local: false };
+    const token = cancellationTokenSource().token;
+    const user = { role: 1, content: [{ value: 'abcd' }, { value: 'efgh' }] };
+    const progress = collectProgress();
+    try {
+      await provider.provideLanguageModelChatResponse(model, [user], {}, progress, token);
+      assert.equal(requests[0].messages[0].content, 'abcdefgh');
+      assert.equal(await provider.provideTokenCount(model, 'x'.repeat(100), token), 34);
+      const fragments = progress.reports.filter(part => part instanceof LanguageModelTextPart);
+      assert.deepEqual(fragments.map(part => part.value), ['Hel', 'lo']);
+      const history = [
+        user,
+        { role: 2, content: structuredClone(fragments) },
+        { role: 1, content: [{ value: 'next' }] }
+      ];
+      await provider.provideLanguageModelChatResponse(model, history, {}, collectProgress(), token);
+      assert.deepEqual(requests[1].messages, [
+        { role: 'user', content: 'abcdefgh' },
+        { role: 'assistant', content: 'Hello' },
+        { role: 'user', content: 'next' }
+      ]);
+    } finally {
+      provider.dispose();
+    }
+  });
+});
+
 for (const { name, options = {}, extraParts = [] } of [
   {
     name: 'tool definitions',

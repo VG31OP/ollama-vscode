@@ -149,6 +149,39 @@ test('preserves image data on regular chat messages', () => {
   }]);
 });
 
+test('concatenates adjacent assistant text fragments without adding separators', () => {
+  assert.deepEqual(toOllamaMessages([{
+    role: vscode.LanguageModelChatMessageRole.Assistant,
+    content: [
+      new LanguageModelTextPart('Hel'),
+      new LanguageModelTextPart('lo'),
+      new LanguageModelTextPart(' world')
+    ]
+  }]), [{
+    role: 'assistant',
+    content: 'Hello world',
+    images: undefined,
+    tool_calls: undefined
+  }]);
+});
+
+test('separates text data parts from adjacent text fragments', () => {
+  assert.deepEqual(toOllamaMessages([{
+    role: vscode.LanguageModelChatMessageRole.User,
+    content: [
+      new LanguageModelTextPart('Hel'),
+      new LanguageModelTextPart('lo'),
+      new LanguageModelDataPart(new TextEncoder().encode('world'), 'text/plain'),
+      new LanguageModelTextPart('!')
+    ]
+  }]), [{
+    role: 'user',
+    content: 'Hello\nworld\n!',
+    images: undefined,
+    tool_calls: undefined
+  }]);
+});
+
 test('forwards image data from tool results on the corresponding tool message', () => {
   const imageBytes = Uint8Array.from([0, 1, 2, 3]);
   const result = new LanguageModelToolResultPart('call-4', [
@@ -165,7 +198,7 @@ test('forwards image data from tool results on the corresponding tool message', 
 });
 
 test('converts plain message parts that do not inherit from vscode classes', () => {
-  const plainTextPart = { value: 'Hello from remote host', audience: [0] };
+  const plainTextPart = { value: 'Hello ', audience: [0] };
   const plainDataPart = { mimeType: 'text/plain', data: new TextEncoder().encode('decoded note') };
   const plainToolCallPart = {
     callId: 'call-5',
@@ -178,7 +211,7 @@ test('converts plain message parts that do not inherit from vscode classes', () 
   };
 
   assert.deepEqual(toOllamaMessages([
-    { role: 1, content: [plainTextPart, plainDataPart] },
+    { role: 1, content: [plainTextPart, { value: 'from remote host' }, plainDataPart] },
     { role: 2, content: [plainToolCallPart] },
     { role: 1, content: [plainToolResultPart] }
   ]), [
@@ -218,19 +251,19 @@ test('preserves foreign-realm text, byte arrays, and nested tool results', () =>
     }
     const image = new DataPart(new Uint8Array([9, 1, 2, 3, 9]).subarray(1, 4), 'image/png');
     return [
-      { role: 1, content: [new TextPart('hello'), new DataPart(new Uint8Array([104, 105]), 'text/plain'), image] },
+      { role: 1, content: [new TextPart('hel'), new TextPart('lo'), new DataPart(new Uint8Array([104, 105]), 'text/plain'), image] },
       { role: 2, content: [{ callId: 'foreign-call', name: 'lookup', input: {} }] },
-      { role: 1, content: [{ callId: 'foreign-call', content: [new TextPart('result', [0]), image] }] }
+      { role: 1, content: [{ callId: 'foreign-call', content: [new TextPart('first', [0]), new TextPart('second'), image] }] }
     ];
   })()`);
 
   assert.equal(messages[0].content[0] instanceof LanguageModelTextPart, false);
-  assert.equal(messages[0].content[1].data instanceof Uint8Array, false);
+  assert.equal(messages[0].content[2].data instanceof Uint8Array, false);
   assert.deepEqual(JSON.parse(JSON.stringify(toOllamaMessages(messages))), [
     { role: 'user', content: 'hello\nhi', images: ['AQID'] },
     { role: 'assistant', content: '',
       tool_calls: [{ id: 'foreign-call', function: { name: 'lookup', arguments: {} } }] },
-    { role: 'tool', content: 'result', images: ['AQID'], tool_call_id: 'foreign-call' }
+    { role: 'tool', content: 'first\nsecond', images: ['AQID'], tool_call_id: 'foreign-call' }
   ]);
 });
 

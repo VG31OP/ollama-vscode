@@ -6,19 +6,15 @@ export function toOllamaMessages(messages: readonly vscode.LanguageModelChatRequ
   const converted: OllamaChatMessage[] = [];
 
   for (const message of messages) {
-    const text: string[] = [];
+    const text = textSegments(message.content);
     const images: string[] = [];
     const toolCalls: NonNullable<OllamaChatMessage['tool_calls']> = [];
     const toolResults: OllamaChatMessage[] = [];
 
     for (const part of message.content) {
-      if (isTextPart(part)) {
-        text.push(part.value);
-      } else if (isDataPart(part)) {
+      if (isDataPart(part)) {
         if (part.mimeType.startsWith('image/')) {
           images.push(Buffer.from(part.data).toString('base64'));
-        } else if (part.mimeType.startsWith('text/')) {
-          text.push(new TextDecoder().decode(part.data));
         }
       } else if (isToolCallPart(part)) {
         toolCalls.push({
@@ -52,6 +48,30 @@ export function toOllamaMessages(messages: readonly vscode.LanguageModelChatRequ
   }
 
   return converted;
+}
+
+export function textSegments(parts: readonly unknown[]): string[] {
+  const segments: string[] = [];
+  let adjacentText = false;
+
+  for (const part of parts) {
+    if (isTextPart(part)) {
+      if (adjacentText) {
+        segments[segments.length - 1] += part.value;
+      } else {
+        segments.push(part.value);
+      }
+      adjacentText = true;
+      continue;
+    }
+
+    adjacentText = false;
+    if (isDataPart(part) && part.mimeType.startsWith('text/')) {
+      segments.push(new TextDecoder().decode(part.data));
+    }
+  }
+
+  return segments;
 }
 
 export function toOllamaTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): OllamaTool[] {

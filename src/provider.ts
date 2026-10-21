@@ -15,6 +15,7 @@ import {
 import {
   isDataPart,
   isTextPart,
+  textSegments,
   toOllamaMessages,
   toOllamaTools
 } from './convert';
@@ -1118,16 +1119,6 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
-function partToText(part: vscode.LanguageModelInputPart | unknown): string {
-  if (isTextPart(part)) {
-    return part.value;
-  }
-  if (isDataPart(part) && part.mimeType.startsWith('text/')) {
-    return new TextDecoder().decode(part.data);
-  }
-  return '';
-}
-
 class CalibratedTokenEstimator {
   private readonly charsPerToken = new Map<string, number>();
 
@@ -1162,7 +1153,7 @@ class CalibratedTokenEstimator {
 }
 
 function inputToText(input: string | vscode.LanguageModelChatRequestMessage): string {
-  return typeof input === 'string' ? input : input.content.map(partToText).join('\n');
+  return typeof input === 'string' ? input : textSegments(input.content).join('\n');
 }
 
 export function createFetch(

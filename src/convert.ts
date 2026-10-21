@@ -155,7 +155,12 @@ export function isTextPart(part: unknown): part is vscode.LanguageModelTextPart 
     !('metadata' in part) &&
     !('$mid' in part) &&
     // Preserve arbitrary JSON tool results with a value and additional fields.
-    Object.keys(part).every(key => key === 'value' || key === 'audience')
+    Object.keys(part).every(key => key === 'value' || key === 'audience') &&
+    (!('audience' in part) || part.audience === undefined || (
+      Array.isArray(part.audience) &&
+      // VS Code audiences are Assistant (0), User (1), and Extension (2).
+      part.audience.every(audience => audience === 0 || audience === 1 || audience === 2)
+    ))
   );
 }
 

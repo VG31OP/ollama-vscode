@@ -125,12 +125,25 @@ test('preserves text, supported JSON data, and JSON-compatible tool result conte
     new LanguageModelDataPart(new TextEncoder().encode('{"status":"ok"}'), 'application/json; charset=utf-8'),
     new LanguageModelDataPart(new TextEncoder().encode('{"vendor":true}'), 'application/vnd.example+json'),
     { legacy: true },
-    { value: '42', unit: 'ms', source: 'synthetic timer' }
+    { value: '42', unit: 'ms', source: 'synthetic timer' },
+    { value: 'release notes', audience: 'internal' },
+    { value: 'deployment status', audience: ['admins'] },
+    { value: 'announcement', audience: [42] }
   ]);
 
   assert.deepEqual(toOllamaMessages([{ role: 1, content: [result] }]), [{
     role: 'tool',
-    content: 'first\nsecond\n{"status":"ok"}\n{"vendor":true}\n{"legacy":true}\n{"value":"42","unit":"ms","source":"synthetic timer"}',
+    content: [
+      'first',
+      'second',
+      '{"status":"ok"}',
+      '{"vendor":true}',
+      '{"legacy":true}',
+      '{"value":"42","unit":"ms","source":"synthetic timer"}',
+      '{"value":"release notes","audience":"internal"}',
+      '{"value":"deployment status","audience":["admins"]}',
+      '{"value":"announcement","audience":[42]}'
+    ].join('\n'),
     tool_call_id: 'call-3'
   }]);
 });
